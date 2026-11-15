@@ -1,6 +1,6 @@
 {
   "name": "admiralty-gate",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Source-graded information-flow control for LLM agents that read untrusted text and hold tools: provenance, a deterministic policy gate, an MCP proxy, report grounding, independence-aware corroboration, ACH and calibration.",
   "keywords": [
     "prompt-injection",

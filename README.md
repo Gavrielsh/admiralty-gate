@@ -40,6 +40,40 @@ Then open **http://localhost:3000**. The API runs on `http://127.0.0.1:4319`. No
 
 The console is a **local tool**: it binds to loopback, has no login, and can approve tool calls. Do not expose it on a network. Every sandbox tool is simulated; nothing is looked up or scanned.
 
+### Fusion workbench (v0.4)
+
+Three more views sit on the same server: a **fusion map** (MapLibre) of corroborated incidents, fraud-ring clusters and an event heatmap; a **corroboration breakdown** (raw sources vs independent origins, noisy-OR, grade distribution); and an **ACH matrix** that blocks a premature attribution. Open http://localhost:3000/fusion and press *Load demo scenario* (invented data) to see all three.
+
+![Fusion map: one released incident, two quarantined, two rings](docs/img/fusion-map.png)
+
+It runs with nothing installed (in-memory store, in-process queue). For persistence and spatial queries, start PostgreSQL (PostGIS + pgvector) and Redis and point the server at them in `.env.local`:
+
+```bash
+cp .env.example .env.local
+```
+
+```bash
+docker compose --env-file .env.local up -d
+```
+
+```bash
+npm run dev
+```
+
+Set `POSTGRES_PASSWORD`, `DATABASE_URL` and `REDIS_URL` in `.env.local` first (the example file shows the shape). The server creates its tables and the `postgis` and `vector` extensions on first start.
+
+| Route | Purpose |
+|---|---|
+| `POST /api/ingest` | Register items as **untrusted** provenance with an Admiralty grade (`F6` if none given). Queued: de-duplicate, geo-enrich, cluster. |
+| `GET /api/provenance` | Query items by claim, kind, source type, grade, time, bounding box, indicator (`ip:203.0.113.9`) or text similarity (`q=`); returns entity links. |
+| `POST /api/corroborate` | `clusterItems` + `corroborate` + `canRelease` for a stored claim or ad-hoc evidence: independent clusters, noisy-OR, echo reduction, release decision. |
+| `POST /api/ach` | Deterministic ACH with critical evidence and an attribution gate. |
+| `GET /api/geo/incidents`, `GET /api/geo/heatmap` | GeoJSON for the map; filter by `released`, `minGrade`, `since`/`until`, `bbox`, `kind`. |
+| `POST /api/ingest/ledger` | HMAC-signed webhook for ledger/session anomaly events (IP, proxy flag, ASN, wallet, device). |
+| `GET /api/collectors`, `POST /api/collectors/run` | Operator-configured feeds, Telegram exports and JSONL files, fetched by an MCP collector behind `McpGateProxy`. |
+
+How it works, the collector configuration, the webhook signature and what was and was not verified: [docs/FUSION.md](docs/FUSION.md).
+
 To put a real MCP server behind the gate with the dashboard as the approval channel:
 
 ```bash
@@ -68,7 +102,7 @@ I searched for an open-source project doing exactly this combination and did not
 | `grades` | Admiralty A-F x 1-6 grades, numeric evidence weights, ICD-203-style estimative language. |
 | `text` | Multilingual normalisation (Hebrew niqqud, Arabic harakat, bidi controls, zero-width characters, Unicode-tag smuggling decoded). Injection-phrase detection (EN/HE/AR/FA/RU) as **telemetry only**. |
 | `provenance` | `ProvenanceLedger`: records every span entering the agent's context as trusted (operator) or untrusted; traces tool arguments back to spans by **whole-token** match. |
-| `independence` | Union-find clustering: same owner, explicit citation/forward, or near-duplicate text = one origin. |
+| `independence` | Union-find clustering: same owner, explicit citation/forward, or near-duplicate text = one origin. Opt-in: shared hard indicators (with hub suppression), time bursts, spatial proximity. Returns why items were merged. |
 | `corroborate` | Per-claim support/contradiction via noisy-OR across independent clusters; flags `echo-chamber`, `single-source`, `contested`; `canRelease()` as a deterministic release rule. |
 | `guard` | `Gate`: tiers (`view`, `lookup-infra`, `lookup-person`, `active-probe`, `publish`), fail-closed on untraceable targets for sensitive tiers, authorised-target allowlist for probes. |
 | `ach` | Deterministic ACH: ranking by weighted inconsistency, diagnosticity, **load-bearing evidence** (removal flips the leader), pluggable LLM cell scorer that rejects off-scale output. |
@@ -79,6 +113,7 @@ I searched for an open-source project doing exactly this combination and did not
 | `policy` | Strictly validated JSON policy (an unknown key or tier is an error, never a silently weaker policy). |
 | `ground` | Sentence-level lineage of a drafted report: supporting origins, independent-origin count, best grade, and figures or identifiers that appear in no source. |
 | `cli` | `mcp-proxy`, `decide`, `ground`, `verify-audit`. |
+| `entities`, `geo` | Hard-indicator extraction (IP/CIDR, ASN, wallets, transaction hashes, domains, phones, Telegram) and geospatial checks: distance, coordinates in text, coordinates vs named place vs IP geolocation. Pure; a gazetteer and GeoIP results are inputs. |
 | `adapters/osiris` | Tiering for OSIRIS's `recon` tool (including its alias table, so `breach`/`port_scan` cannot dodge it) and a wrapper for its `exec`. |
 
 Zero runtime dependencies. TypeScript, strict mode.
@@ -105,7 +140,7 @@ The library lives in `packages/core`; `apps/server` and `apps/web` are the conso
 
 ```bash
 npm install
-npm test                    # 95 core tests + 32 server integration tests
+npm test                    # 123 core tests + 54 server tests (63 with TEST_DATABASE_URL and TEST_REDIS_URL set)
 npm run build               # core, server, web
 npm run redteam             # regenerate RESULTS.md
 cd packages/core

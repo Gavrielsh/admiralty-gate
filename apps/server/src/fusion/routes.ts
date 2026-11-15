@@ -255,7 +255,8 @@ export function registerFusionRoutes(app: FastifyInstance, c: FusionRouteContext
       const located = all.filter(i => i.geo);
       // Entity-cluster links: a line between two members that share an indicator (or were otherwise judged coordinated).
       const links: unknown[] = [];
-      for (const inc of located) {
+      // Drawn for rings only: a claim's members are sources, and a line between two sources' locations says nothing.
+      for (const inc of located.filter(i => i.kind === 'ring')) {
         const wanted = inc.links.filter(l => l.reason === 'shared-indicator' || l.reason === 'burst' || l.reason === 'proximity').slice(0, 200);
         if (!wanted.length) continue;
         const geo = new Map<string, { lat: number; lon: number }>();

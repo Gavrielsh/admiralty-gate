@@ -9,6 +9,9 @@ import { cx } from './ui';
 
 const NAV = [
   { href: '/', label: 'Live interceptor', hint: 'Tool calls, approvals, playground' },
+  { href: '/fusion', label: 'Fusion map', hint: 'Incidents, rings, heatmap' },
+  { href: '/corroboration', label: 'Corroboration', hint: 'Raw sources vs independent origins' },
+  { href: '/ach', label: 'ACH matrix', hint: 'Competing hypotheses' },
   { href: '/grounding', label: 'Grounding inspector', hint: 'Which sources back each sentence' },
   { href: '/audit', label: 'Audit log', hint: 'Hash-chained, tamper-evident' },
   { href: '/policy', label: 'Policy editor', hint: 'Strict JSON policy' },

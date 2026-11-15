@@ -14,6 +14,8 @@ interface State {
   running: string[];
   auditTick: number;
   policyTick: number;
+  /** Bumps when provenance is ingested or an incident is recomputed. */
+  fusionTick: number;
 }
 type Action =
   | { t: 'event'; e: GateEvent }
@@ -21,7 +23,7 @@ type Action =
   | { t: 'conn'; up: boolean }
   | { t: 'approvals'; list: PendingApproval[] };
 
-const empty: State = { connected: false, boot: null, lastSeq: 0, calls: [], approvals: [], lines: [], running: [], auditTick: 0, policyTick: 0 };
+const empty: State = { connected: false, boot: null, lastSeq: 0, calls: [], approvals: [], lines: [], running: [], auditTick: 0, policyTick: 0, fusionTick: 0 };
 const MAX_CALLS = 300;
 
 function reduce(s: State, a: Action): State {
@@ -61,6 +63,10 @@ function reduce(s: State, a: Action): State {
     case 'audit.tampered':
     case 'audit.restored':
       n.auditTick = s.auditTick + 1;
+      break;
+    case 'incident.updated':
+    case 'fusion.ingested':
+      n.fusionTick = s.fusionTick + 1;
       break;
     case 'policy.updated':
       n.policyTick = s.policyTick + 1;

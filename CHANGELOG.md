@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0
+
+Core (still zero dependencies, no I/O):
+- `entities`: deterministic hard-indicator extraction. `geo`: haversine, coordinates in text, gazetteer check of coordinates against named places and IP geolocation.
+- `clusterItems`: opt-in merging by shared indicators (with hub suppression), temporal bursts and spatial proximity; returns `links` and `geoFlags`. Existing callers are unaffected.
+- `corroborate` / `canRelease`: `coordinated` and `geo-mismatch` flags, `echoReduction`, optional `blockGeoMismatch`.
+- `groundReport`: `unsupportedEntities` (IPs, wallets, hashes, coordinates within a tolerance) and `unsupportedLinks` (two real identifiers no single source connects).
+- `attributionGate` for ACH. OSIRIS adapter: `osint-fetch`, `geo-enrich`, `entity-graph` tiers; tool output recorded with a grade (F6 when ungraded).
+
+Server:
+- Fusion pipeline (`ingest-osint`, `geo-enrich`, `corroborate-cluster`) on an in-process queue or BullMQ/Redis; store in memory or PostgreSQL with PostGIS and pgvector.
+- Collector MCP server (feeds, Telegram exports, JSONL) run behind `McpGateProxy`; HMAC-signed ledger webhook; offline GeoIP table; ring detection.
+- New routes: `/api/ingest`, `/api/provenance`, `/api/corroborate`, `/api/ach`, `/api/geo/incidents`, `/api/geo/heatmap`, `/api/collectors`, `/api/ingest/ledger`.
+- Audit mirror in the store (the file stays the authority); `policy.json` hot reload.
+
+Web: fusion map (MapLibre, offline outlines), corroboration breakdown, ACH matrix.
+
 ## 0.3.0
 
 - Repository is now an npm workspace: the library moved to `packages/core` (package name and API unchanged).

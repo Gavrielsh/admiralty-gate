@@ -59,3 +59,41 @@ export interface GroundingResult {
   summary: { sentences: number; operator: number; grounded: number; weak: number; ungrounded: number; singleOrigin: number; withUnsupportedSpecifics: number };
   sources: { spanId: string; id: string; kind: string; grade?: string; trusted: boolean; text: string }[];
 }
+
+export type IncidentStatus = 'released' | 'quarantined' | 'ring';
+export interface IncidentProps {
+  id: string; kind: 'claim' | 'ring'; status: IncidentStatus; title: string; released: boolean; confidence: number;
+  independentSupport: number; rawItems: number; echoReduction: number; bestGrade: string | null; flags: string[];
+  reasons: string[]; firstAt: number; lastAt: number; sharedIndicators: string[];
+}
+export interface GeoFeature<P> { type: 'Feature'; geometry: { type: 'Point'; coordinates: [number, number] } | { type: 'LineString'; coordinates: [number, number][] }; properties: P }
+export interface IncidentCollection {
+  type: 'FeatureCollection';
+  features: GeoFeature<IncidentProps | { kind: 'link'; incident: string; status: IncidentStatus; reason: string; detail: string | null }>[];
+  meta: { incidents: number; located: number; withoutLocation: { id: string; title: string; status: IncidentStatus }[]; store: string };
+}
+export interface HeatCollection { type: 'FeatureCollection'; features: GeoFeature<{ count: number }>[]; meta: { cell: number; cells: number; events: number; max: number; store: string } }
+export interface CorroborationView {
+  claim: string; rawSources: number; independentClusters: number; echoReduction: number;
+  noisyOr: { support: number; contradiction: number; confidence: number };
+  release: { allowed: boolean; reasons: string[] };
+  gradeDistribution: Record<string, number>;
+  members: { id: string; sourceId: string; sourceType: string; grade: string; stance: string; text: string; at: number; cluster: string }[];
+  assessment: { phrase: string; flags: string[]; independentSupport: number; independentContradiction: number; rawSupportItems: number; links: { a: string; b: string; reason: string; detail?: string }[]; geoFlags: Record<string, { kind: string; place?: string; distanceKm?: number }[]>; clusters: { id: string; stance: string; members: string[]; weight: number; bestGrade: string }[] };
+}
+export interface AchResponse {
+  result: {
+    ranking: { id: string; label: string; inconsistency: number; consistency: number }[]; leader: string; margin: number;
+    diagnosticity: { id: string; label: string; weight: number; diagnosticity: number }[];
+    critical: { id: string; label: string; leaderWithoutIt: string }[]; nonDiagnostic: string[];
+  };
+  attribution: { allowed: boolean; reasons: string[]; leader: string };
+}
+export interface FusionStatus { store: string; queue: string; items: number; claims: number; geoipRows: number; ledgerWebhook: boolean }
+
+/** Status colours: validated as a set against the dark surface for colour-vision deficiency; always paired with a shape and a label. */
+export const STATUS: Record<IncidentStatus, { color: string; label: string; hint: string }> = {
+  released: { color: '#199e70', label: 'Released', hint: 'corroborated by independent origins; passes the release rule' },
+  quarantined: { color: '#c98500', label: 'Quarantined', hint: 'held back: unverified, single-source, echo or inconsistent' },
+  ring: { color: '#9085e9', label: 'Ring', hint: 'accounts linked by shared wallet, device or address; for analyst review' },
+};

@@ -34,8 +34,13 @@ async function mk(backend: (typeof backends)[number], opts: Partial<AppOptions> 
 }
 afterEach(async () => {
   for (const a of apps.splice(0)) {
-    await a.fusion.idle();
-    if (a.queue instanceof BullQueue) await a.queue.obliterate();
+    // A test may already have closed its app (the restart test does).
+    try {
+      await a.fusion.idle();
+      if (a.queue instanceof BullQueue) await a.queue.obliterate();
+    } catch {
+      /* queue already closed */
+    }
     await a.fastify.close();
   }
 });
@@ -271,6 +276,7 @@ describe.each(backends)('fusion on $name', backend => {
 
     // Same database, new process: items, incidents and the ledger come back.
     const schema = (first.store as unknown as { schema: string }).schema;
+    if (first.queue instanceof BullQueue) await first.queue.obliterate();
     await first.fastify.close();
     const second = await mk(backend, { dataDir: first.dir, store: new PgStore(PG!, schema) });
     expect((await get<{ total: number }>(second, '/api/provenance')).total).toBe(35);

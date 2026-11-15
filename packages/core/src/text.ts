@@ -15,6 +15,8 @@ const TAG_CHARS = /[\u{E0000}-\u{E007F}]/gu;
 /** Bidirectional controls: override/embedding/isolates, relevant for Hebrew/Arabic/Persian text. */
 const BIDI = /[‪-‮⁦-⁩‎‏؜]/g;
 
+const NON_ASCII = /[^\x00-\x7f]/;
+
 export type TextFlag =
   | 'invisible-chars'
   | 'bidi-controls'
@@ -77,6 +79,8 @@ export function sanitiseUntrusted(raw: string): Sanitised {
  * (Arabic harakat, Hebrew niqqud, Latin accents) removed, whitespace collapsed.
  */
 export function canonical(raw: string): string {
+  // Plain ASCII has no invisible characters, tag characters or combining marks, and normalisation leaves it alone.
+  if (!NON_ASCII.test(raw)) return raw.toLowerCase().replace(/\s+/g, ' ').trim();
   return sanitiseUntrusted(raw)
     .clean.normalize('NFKD')
     .replace(/\p{M}+/gu, '')

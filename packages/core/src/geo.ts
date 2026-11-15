@@ -82,11 +82,26 @@ export const SAMPLE_GAZETTEER: readonly Place[] = [
   { name: 'Taiwan Strait', bbox: [117, 22, 121.5, 26] },
 ];
 
-/** Places named in a text (whole-token match on name or alias, any script). Longer names win over ones they contain. */
+/** Tokenised names per gazetteer, built once: tokenising every name for every text dominated large runs. */
+const NAME_CACHE = new WeakMap<readonly Place[], { place: Place; names: string[][] }[]>();
+
+function namesOf(gazetteer: readonly Place[]): { place: Place; names: string[][] }[] {
+  let c = NAME_CACHE.get(gazetteer);
+  if (!c) {
+    c = gazetteer.map(place => ({ place, names: [place.name, ...(place.aliases ?? [])].map(n => tokens(n)).filter(t => t.length > 0) }));
+    NAME_CACHE.set(gazetteer, c);
+  }
+  return c;
+}
+
+/** Places named in a text (whole-token match on name or alias, any script). */
 export function findPlaces(text: string, gazetteer: readonly Place[] = SAMPLE_GAZETTEER): Place[] {
   const hay = tokens(text);
-  const hits = gazetteer.filter(p => [p.name, ...(p.aliases ?? [])].some(n => containsRun(hay, tokens(n))));
-  return hits;
+  if (hay.length === 0) return [];
+  const present = new Set(hay);
+  return namesOf(gazetteer)
+    .filter(e => e.names.some(n => present.has(n[0]!) && (n.length === 1 || containsRun(hay, n))))
+    .map(e => e.place);
 }
 
 /** 0 when the point is inside the place's box, else the distance to the nearest point of the box. */

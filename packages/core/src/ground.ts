@@ -28,6 +28,11 @@ export type GroundStatus =
   | 'grounded'
   /** Only partially found in any source. */
   | 'weak'
+  /**
+   * Little or no shared wording, but an embedding supplied by the caller says a source means the same thing
+   * (a translation or a paraphrase). Weaker than 'grounded': it rests on a model's judgement of similarity.
+   */
+  | 'paraphrase'
   /** Not found in any recorded source: model-originated. */
   | 'ungrounded';
 
@@ -52,6 +57,8 @@ export interface GroundedSentence {
   unsupportedSpecifics: string[];
   /** Supporting span carried injection-style telemetry flags. */
   fromFlaggedSource: boolean;
+  /** Best caller-supplied semantic score for this sentence, when semantic matches were given. */
+  semanticScore?: number;
   /**
    * Typed view of the hard identifiers in `unsupportedSpecifics`: IPs, wallets, transaction hashes, ASNs, phones,
    * handles, domains and coordinate pairs that no recorded source contains. A coordinate pair is "found" when a
@@ -74,6 +81,11 @@ export interface GroundOptions extends ClusterOptions {
   supportBand?: number;
   /** How far a coordinate pair in the report may be from one in a source and still count as that location. Default 1 km. */
   coordToleranceKm?: number;
+  /**
+   * Semantic matches computed OUTSIDE the core: for a sentence index (its position in `sentences(report)`), the
+   * spans an embedding model finds closest in meaning. Used only when wording does not already ground the sentence.
+   */
+  semanticMatches?: { matches: Readonly<Record<number, readonly { spanId: string; score: number }[]>>; threshold?: number };
 }
 
 /** Sentence split over Latin, Hebrew, Arabic, Persian, Urdu, Devanagari and CJK terminators, and line breaks. */
@@ -115,7 +127,8 @@ export function groundReport(report: string, ledger: ProvenanceLedger, opts: Gro
   const n = spans.length;
   const idf = (t: string): number => Math.log((n + 1) / ((df.get(t) ?? 0) + 0.5)) + 0.1;
 
-  return sentences(report).map<GroundedSentence>(text => {
+  const spanById = new Map(spans.map(s => [s.id, s]));
+  return sentences(report).map<GroundedSentence>((text, sentenceIndex) => {
     const toks = [...new Set(tokens(text))];
     const total = toks.reduce((a, t) => a + idf(t), 0);
     const scored: { span: Span; overlap: number }[] = [];
@@ -127,10 +140,21 @@ export function groundReport(report: string, ledger: ProvenanceLedger, opts: Gro
     }
     scored.sort((a, b) => b.overlap - a.overlap);
     const best = scored[0]?.overlap ?? 0;
-    const supporting = best >= lo ? scored.filter(x => x.overlap >= best * band) : [];
+    let supporting = best >= lo ? scored.filter(x => x.overlap >= best * band) : [];
+    let status: GroundStatus = best >= hi ? 'grounded' : best >= lo ? 'weak' : 'ungrounded';
+    let semanticScore: number | undefined;
+    if (opts.semanticMatches) {
+      const thr = opts.semanticMatches.threshold ?? 0.85;
+      const matches = (opts.semanticMatches.matches[sentenceIndex] ?? []).filter(m => spanById.has(m.spanId)).sort((a, b) => b.score - a.score);
+      semanticScore = matches[0]?.score;
+      const good = matches.filter(m => m.score >= thr);
+      if (status !== 'grounded' && good.length) {
+        status = 'paraphrase';
+        supporting = good.map(m => ({ span: spanById.get(m.spanId)!, overlap: scored.find(x => x.span.id === m.spanId)?.overlap ?? 0 }));
+      }
+    }
     const untrusted = supporting.filter(x => !x.span.trusted);
 
-    let status: GroundStatus = best >= hi ? 'grounded' : best >= lo ? 'weak' : 'ungrounded';
     if (status !== 'ungrounded' && supporting.some(x => x.span.trusted && x.overlap >= hi)) status = 'operator';
 
     const { clusters } = clusterItems(
@@ -176,6 +200,7 @@ export function groundReport(report: string, ledger: ProvenanceLedger, opts: Gro
       unsupportedLinks,
     };
     if (bestGrade) out.bestGrade = gradeString(bestGrade);
+    if (semanticScore !== undefined) out.semanticScore = semanticScore;
     return out;
   });
 }

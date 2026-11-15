@@ -149,7 +149,7 @@ export function corroborate(evidence: readonly Evidence[], opts: ClusterOptions 
     if (rawSupportItems >= 3 && supportClusters.length <= 1) flags.add('echo-chamber');
     if (support >= 0.4 && contradiction >= 0.4) flags.add('contested');
     const supporting = new Set(list.filter(e => e.stance === 'supports').map(e => e.id));
-    if (links.some(l => (l.reason === 'shared-indicator' || l.reason === 'burst' || l.reason === 'proximity') && supporting.has(l.a) && supporting.has(l.b)))
+    if (links.some(l => (l.reason === 'shared-indicator' || l.reason === 'burst' || l.reason === 'proximity' || l.reason === 'semantic') && supporting.has(l.a) && supporting.has(l.b)))
       flags.add('coordinated');
     if ([...geoFlags.keys()].some(id => supporting.has(id))) flags.add('geo-mismatch');
 

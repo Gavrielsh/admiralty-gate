@@ -4,6 +4,7 @@
 npm ci
 npm run typecheck && npm test && npm run build
 npm run redteam      # must leave RESULTS.md unchanged unless you changed the corpus or the gate
+npm run dev          # console at http://localhost:3000, API at http://127.0.0.1:4319
 ```
 
 Ground rules, in order of importance:

@@ -120,7 +120,8 @@ export function scalarLeaves(v: unknown, depth = 0): (string | number)[] {
 
 const RANK: Record<Trace['class'], number> = { trusted: 0, tainted: 1, unknown: 2 };
 
-function matchesAuthorised(target: string, authorised: readonly string[]): boolean {
+/** Is `target` exactly one host that is, or is a subdomain of, an entry in the operator's authorised list? */
+export function isAuthorisedHost(target: string, authorised: readonly string[]): boolean {
   if (!isSingleHost(target)) return false;
   const h = hostOf(target).replace(/\.$/, '');
   return authorised.some(a => {
@@ -176,7 +177,7 @@ export class Gate {
         // Report the least-trusted class seen for this argument.
         if (traces[name] === undefined || RANK[t.class] > RANK[traces[name]!]) traces[name] = t.class;
 
-        if (spec.tier === 'active-probe' && !matchesAuthorised(String(leaf), this.cfg.authorisedTargets ?? [])) {
+        if (spec.tier === 'active-probe' && !isAuthorisedHost(String(leaf), this.cfg.authorisedTargets ?? [])) {
           verdict = 'deny';
           reasons.push(
             isSingleHost(String(leaf))

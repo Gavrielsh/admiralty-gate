@@ -121,6 +121,34 @@ describe('McpGateProxy', () => {
     expect(JSON.stringify(r.blocked(3))).toContain('untrusted');
   });
 
+  it('an out-of-band approve hook replaces elicitation, and only a resolved true runs the call', async () => {
+    for (const [answer, runs] of [[true, true], [false, false], ['yes', false], [new Error('down'), false]] as const) {
+      const toClient: RpcMessage[] = [];
+      const toServer: RpcMessage[] = [];
+      const asked: string[] = [];
+      const proxy = new McpGateProxy({
+        config: policy.config, toClient: m => toClient.push(m), toServer: m => toServer.push(m),
+        approve: async (d, call) => {
+          asked.push(`${call.tool}:${d.verdict}`);
+          if (answer instanceof Error) throw answer;
+          return answer as boolean;
+        },
+      });
+      // The client offers NO elicitation: the hook still gets asked.
+      proxy.onClientMessage({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { capabilities: {} } });
+      proxy.onClientMessage({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'find_person', arguments: { username: 'someone_new' } } });
+      await new Promise(r => setTimeout(r, 5));
+      expect(asked).toEqual(['find_person:require_approval']);
+      expect(toServer.some(m => m.id === 7), String(answer)).toBe(runs);
+      expect(toClient.some(m => m.id === 7 && (m.result as { isError?: boolean })?.isError)).toBe(!runs);
+      expect(toClient.some(m => m.method === 'elicitation/create')).toBe(false);
+      // Denied calls never consult the hook.
+      proxy.onClientMessage({ jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'scan', arguments: { host: 'victim.example.com' } } });
+      await new Promise(r => setTimeout(r, 5));
+      expect(asked).toHaveLength(1);
+    }
+  });
+
   it('every decision lands in a verifiable audit chain', () => {
     const r = rig(false);
     r.call(1, 'news', {});

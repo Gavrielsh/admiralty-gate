@@ -106,5 +106,5 @@ out('- The gate does not stop a hijacked model from *saying* false things in pro
 out('- Only the `recon` and `forecast` tools of the OSIRIS assistant are risk-tiered here; the remaining tools are treated as view tier and were not audited for side effects.');
 
 const md = lines.join('\n') + '\n';
-writeFileSync(new URL('../RESULTS.md', import.meta.url), md);
+writeFileSync(new URL('../../../RESULTS.md', import.meta.url), md);
 console.log(md);

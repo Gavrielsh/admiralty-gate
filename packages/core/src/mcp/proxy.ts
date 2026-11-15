@@ -48,6 +48,12 @@ export interface McpProxyOptions {
   /** How long to wait for a human answer before treating it as "no". Default 5 minutes. */
   approvalTimeoutMs?: number;
   onDecision?: (d: Decision, call: ToolCall) => void;
+  /**
+   * Out-of-band human approval (a dashboard, a pager). When set it is used for every require_approval INSTEAD of
+   * MCP elicitation, so it also works with clients that cannot elicit. Only a resolved `true` runs the call; a
+   * rejection or any other value means no.
+   */
+  approve?: (d: Decision, call: ToolCall) => Promise<boolean>;
 }
 
 const key = (id: Id): string => `${typeof id}:${id}`;
@@ -135,6 +141,18 @@ export class McpGateProxy {
 
     if (d.verdict === 'allow') return this.forwardCall(msg, tool);
     if (d.verdict === 'deny') return this.block(msg, d, 'denied');
+    if (this.o.approve) {
+      const approve = this.o.approve;
+      void Promise.resolve()
+        .then(() => approve(d, call))
+        .then(ok => ok === true, () => false)
+        .then(ok => {
+          this.audit.append('approval', { tool, approved: ok });
+          if (ok) this.forwardCall(msg, tool);
+          else this.block(msg, d, 'a human did not approve it');
+        });
+      return;
+    }
     if (!this.clientElicits) {
       this.audit.append('approval', { tool, approved: false, why: 'client cannot ask a human (no elicitation capability)' });
       return this.block(msg, d, 'needs human approval, and this client offers no way to ask for it');

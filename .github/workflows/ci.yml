@@ -20,6 +20,6 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
-      - run: node dist/cli.js decide --policy examples/policy.example.json --tool whois --args '{"domain":"example.org"}' --user "whois example.org"
+      - run: node packages/core/dist/cli.js decide --policy packages/core/examples/policy.example.json --tool whois --args '{"domain":"example.org"}' --user "whois example.org"
       - name: Red-team report is reproducible
         run: npm run redteam && git diff --exit-code RESULTS.md

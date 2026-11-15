@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- Repository is now an npm workspace: the library moved to `packages/core` (package name and API unchanged).
+- `apps/server`: Fastify API around the library: SSE event stream, human-approval queue, sandbox runner (scripted red-team scenarios, Anthropic and OpenAI agent loops), policy read/write through the strict validator, audit read with chain verification, grounding analysis, and an MCP bridge that uses the dashboard as the approval channel.
+- `apps/web`: Next.js dashboard with live interceptor, grounding inspector, audit viewer and policy editor.
+- Core: `McpProxyOptions.approve` / `StdioProxyOptions.approve` for out-of-band human approval instead of MCP elicitation; `isAuthorisedHost` exported.
+
 ## 0.2.0
 
 Security fixes (upgrade from 0.1.0):

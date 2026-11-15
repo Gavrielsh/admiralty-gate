@@ -1,58 +1,26 @@
 {
-  "name": "admiralty-gate",
-  "version": "0.2.0",
-  "description": "Source-graded information-flow control for LLM agents that read untrusted text and hold tools: provenance, a deterministic policy gate, an MCP proxy, report grounding, independence-aware corroboration, ACH and calibration.",
-  "keywords": [
-    "prompt-injection",
-    "llm",
-    "agents",
-    "mcp",
-    "osint",
-    "provenance",
-    "information-flow-control",
-    "admiralty",
-    "ach",
-    "calibration"
-  ],
+  "name": "admiralty-gate-monorepo",
+  "private": true,
+  "version": "0.3.0",
   "type": "module",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/gavrielsh/admiralty-gate.git"
-  },
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    }
-  },
-  "bin": {
-    "admiralty-gate": "dist/cli.js"
-  },
-  "files": [
-    "dist",
-    "examples/policy.example.json",
-    "README.md",
-    "RESULTS.md",
-    "SECURITY.md",
-    "LICENSE"
+  "workspaces": [
+    "packages/*",
+    "apps/*"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit",
-    "redteam": "tsx examples/redteam-report.ts",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+    "build:core": "npm run build -w admiralty-gate",
+    "build": "npm run build -w admiralty-gate && npm run build -w @admiralty-gate/server && npm run build -w @admiralty-gate/web",
+    "test": "npm test -w admiralty-gate && npm test -w @admiralty-gate/server",
+    "typecheck": "npm run typecheck -w admiralty-gate && npm run build:core && npm run typecheck -w @admiralty-gate/server && npm run typecheck -w @admiralty-gate/web",
+    "redteam": "npm run redteam -w admiralty-gate",
+    "predev": "npm run build:core",
+    "dev": "concurrently -k -n server,web -c cyan,magenta \"npm run dev -w @admiralty-gate/server\" \"npm run dev -w @admiralty-gate/web\"",
+    "start": "concurrently -k -n server,web -c cyan,magenta \"npm run start -w @admiralty-gate/server\" \"npm run start -w @admiralty-gate/web\""
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.6.0",
-    "vitest": "^2.1.0"
+    "concurrently": "^10.0.0"
   }
 }

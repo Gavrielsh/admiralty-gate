@@ -8,6 +8,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import { AuditLog } from '../audit.js';
+import type { Decision, ToolCall } from '../guard.js';
 import type { Policy } from '../policy.js';
 import { McpGateProxy, type RpcMessage } from './proxy.js';
 
@@ -25,6 +26,10 @@ export interface StdioProxyOptions {
   stdin?: Readable;
   stdout?: Writable;
   log?: (line: string) => void;
+  /** See McpProxyOptions.approve: out-of-band human approval instead of MCP elicitation. */
+  approve?: (d: Decision, call: ToolCall) => Promise<boolean>;
+  /** Called with every decision, in addition to the log line. */
+  onDecision?: (d: Decision, call: ToolCall) => void;
 }
 
 function lines(stream: Readable, onMessage: (m: RpcMessage | RpcMessage[]) => void, log: (s: string) => void): void {
@@ -59,7 +64,11 @@ export function runStdioProxy(o: StdioProxyOptions): Promise<number> {
     toClient: m => write(stdout, m),
     toServer: m => write(child.stdin, m),
     ...(o.auditFile ? { audit: AuditLog.file(o.auditFile) } : {}),
-    onDecision: (d, call) => log(`${d.verdict.toUpperCase()} ${call.tool} [${d.tier}] ${d.reasons.join('; ')}`),
+    ...(o.approve ? { approve: o.approve } : {}),
+    onDecision: (d, call) => {
+      log(`${d.verdict.toUpperCase()} ${call.tool} [${d.tier}] ${d.reasons.join('; ')}`);
+      o.onDecision?.(d, call);
+    },
   });
   const syncOperator = () => {
     if (!o.operatorFile || !existsSync(o.operatorFile)) return;

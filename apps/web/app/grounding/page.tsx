@@ -17,6 +17,7 @@ const EXAMPLE_SOURCES: Source[] = [
 const LEVEL: Record<GroundedSentence['level'], { label: string; mark: string; tone: 'green' | 'cyan' | 'amber' | 'red' | 'gray' }> = {
   verified: { label: '2+ independent sources', mark: 'bg-emerald-500/20 decoration-emerald-400', tone: 'green' },
   single: { label: 'single source', mark: 'bg-amber-500/20 decoration-amber-400', tone: 'amber' },
+  paraphrase: { label: 'same meaning, other words (model-judged)', mark: 'bg-violet-500/20 decoration-violet-400', tone: 'cyan' },
   weak: { label: 'partial match', mark: 'bg-orange-500/15 decoration-orange-400', tone: 'amber' },
   ungrounded: { label: 'no source', mark: 'bg-rose-500/20 decoration-rose-400', tone: 'red' },
   operator: { label: 'operator said it', mark: 'bg-cyan-500/15 decoration-cyan-400', tone: 'cyan' },
@@ -82,7 +83,7 @@ export default function GroundingPage() {
       {result && (
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-line bg-panel px-4 py-2.5 text-xs">
           <span className="text-muted">{result.summary.sentences} sentences:</span>
-          {(['verified', 'single', 'weak', 'ungrounded', 'operator'] as const).map(l => {
+          {(['verified', 'single', 'paraphrase', 'weak', 'ungrounded', 'operator'] as const).map(l => {
             const n = result.sentences.filter(s => s.level === l).length;
             return n > 0 && <Badge key={l} tone={LEVEL[l].tone}>{n} · {LEVEL[l].label}</Badge>;
           })}

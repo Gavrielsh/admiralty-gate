@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0
+
+Core (still zero dependencies, no I/O):
+- `clusterItems` no longer compares every pair: an exact prefix-filtered similarity join for near-duplicate text, posting lists for indicators, a time sweep for bursts and a unit-sphere grid for proximity. Same partition as before (parity-tested against the 0.4 code on 400 random inputs); 10,000 events cluster in about 110 ms. `links` reports every pair for groups up to 64 and a connecting chain above that.
+- `ClusterOptions.semantic` and `GroundOptions.semanticMatches`: similarity scores computed by the caller. New grounding status `paraphrase`.
+
+Server:
+- `EmbeddingProvider`: local transformers.js model (default), OpenAI-compatible HTTP, mock. The pgvector column follows the provider's dimension; stored items are re-embedded when it changes.
+- GeoIP from MaxMind `.mmdb` (city, ASN); place names from a GeoNames dump and/or Nominatim with a cache in the store.
+- Fraud rings computed in the store: time window, `GROUP BY` on shared indicators with the hub cap, optional `ST_DWithin` self-join.
+- Tool calls, approvals and incident history persisted; approvals left pending by a dead process are marked expired.
+- `ADMIRALTY_API_KEY` on every `/api` route and `/events`; the server refuses a non-loopback address without it.
+- Live Telegram collector (GramJS) polled through `McpGateProxy`.
+- Default policy registers `osint-fetch`, `geo-enrich`, `entity-graph`.
+
+Web: API-key prompt, timeline restored from stored records, street-level base map with fallback to the bundled outlines.
+
 ## 0.4.0
 
 Core (still zero dependencies, no I/O):

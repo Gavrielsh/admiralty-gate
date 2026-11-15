@@ -35,12 +35,56 @@ Geospatial consistency is a flag, not a merge: coordinates far from every place 
 
 | | Default | With services |
 |---|---|---|
-| Store | in memory, lost on restart | `DATABASE_URL`: PostgreSQL. Items in `fusion_items` with a `GEOGRAPHY(Point, 4326)` column (bounding-box filters, `ST_SnapToGrid` heatmap) and a `vector(256)` column (nearest-text search). |
+| Store | in memory, lost on restart | `DATABASE_URL`: PostgreSQL. Items in `fusion_items` with a `GEOGRAPHY(Point, 4326)` column (bounding-box filters, `ST_SnapToGrid` heatmap, `ST_DWithin` joins) and a `vector(N)` column with an HNSW index. Also: incidents and their history, tool-call records, approvals, the audit mirror, a geocode cache. |
 | Queue | in-process, sequential | `REDIS_URL`: BullMQ queues `ingest-osint`, `geo-enrich`, `corroborate-cluster`, with retries. |
 
-The embedding is a feature-hashed character-trigram vector. It is **lexical**: it finds similar spelling, not similar meaning, and needs no model. Pass a real embedding function of dimension 256 as `embed` in the app options for semantic search.
+What still lives only in memory: the SSE backlog, sandbox run status, and the promise behind a paused tool call. A paused call cannot outlive the process that paused it: after a restart its approval is recorded as `expired` and the call is recorded as never executed.
 
-What stays in memory regardless: pending approvals, the SSE backlog, sandbox runs and call records.
+## Embeddings
+
+`EMBEDDING_PROVIDER` selects the provider. The server computes vectors; the core only ever receives scores.
+
+| Provider | What it is |
+|---|---|
+| `local` (default) | `@huggingface/transformers` on ONNX with `Xenova/multilingual-e5-small` (384 dimensions; Hebrew, Arabic, English and about a hundred other languages). The model is downloaded on first start and cached (`EMBEDDING_CACHE_DIR`); after that it runs offline. `EMBEDDING_MODEL` picks another one. |
+| `http` | Any OpenAI-compatible endpoint: `EMBEDDING_API_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`. |
+| `mock` | Feature-hashed character trigrams. Lexical, not semantic. For tests. |
+
+If the chosen provider cannot start (no network for the first download, a bad URL), the server still starts on the mock and says so at start-up and in `GET /api/fusion/status` (`embedding.degraded`). The vector column is created at the provider's dimension. Starting with a provider of a different dimension rebuilds the column and re-embeds every stored item.
+
+Where semantic scores are used:
+- `GET /api/provenance?q=`: nearest items by meaning.
+- `POST /api/grounding`: a sentence with little shared wording but a close match in meaning is `paraphrase`, which is weaker than `grounded` and labelled as model-judged.
+- `POST /api/corroborate`: two items of one claim that mean the same thing **and** were posted inside the burst window are merged (a translated repost). Similar meaning alone never merges: two independent outlets reporting one event are similar too. The threshold (0.92 cosine) is a starting point, not a calibrated value; it depends on the model.
+
+## Geolocation
+
+- **IP addresses.** Download `GeoLite2-City.mmdb` and optionally `GeoLite2-ASN.mmdb` from MaxMind (free account, their licence applies) and set `MAXMIND_CITY_DB_PATH` / `MAXMIND_ASN_DB_PATH`. The files are read locally with `@maxmind/geoip2-node`; nothing is sent anywhere. `GEOIP_CSV` still works and takes precedence. A missing or unreadable file is reported and ignored.
+- **Place names.** `GEONAMES_TSV_PATH` points at a GeoNames dump (`cities15000.txt`, `cities1000.txt`, ...; CC BY 4.0). Names and alternate names, in any script, are indexed; lookup is by n-gram, so it does not slow down with the size of the file. For a name shared by several places the most populous wins, and a lower-case Latin word that is also a town ("nice", "reading") is not treated as a place. `NOMINATIM_URL` adds a geocoder for explicit place claims (`claimedPlace`) that the local data does not know; answers, including "not found", are cached in the store, failures are not, and requests are spaced at least 1.1 s apart. Use your own Nominatim instance for anything beyond light use. Without either, the small sample gazetteer is used.
+
+## Fraud rings at scale
+
+Ring detection no longer loads every ledger event. The store filters by time (`RING_WINDOW_HOURS`, default 7 days), groups by structural indicator, keeps groups that at least two accounts share, and drops any indicator carried by more than half of the events in the window. Only events in such a group come back; the core then finds connected components among them. A proxy or VPN address is never stored as a linking indicator, so it cannot join accounts.
+
+`RING_PROXIMITY_KM` adds a second kind of link: events from different accounts within that distance and within `RING_PROXIMITY_WINDOW_MIN` of each other. In PostgreSQL this is an `ST_DWithin` self-join on the geography column.
+
+Clustering itself is near-linear in the core (inverted indexes, a time sweep, a spatial grid): 10,000 events in about 110 ms on the machine this was written on. Two honest limits: a single group of thousands of near-identical texts still costs roughly the square of its size to verify, and `indicators.minShared > 1` counts per pair.
+
+## Authentication
+
+Set `ADMIRALTY_API_KEY`. Every `/api` route and `/events` then needs `Authorization: Bearer <key>` or `x-api-key: <key>`. Two routes are exempt: `/api/health`, and `/api/ingest/ledger`, which authenticates each request by HMAC. Without a key the server only starts on a loopback address. The dashboard asks for the key and keeps it in the tab's session storage; it is not built into the page. The MCP bridge reads `ADMIRALTY_API_KEY` from its environment. One shared key is not user management: there are no accounts or roles, and TLS is up to whatever you put in front.
+
+## Default policy: OSIRIS tools
+
+A new `policy.json` registers `osint-fetch`, `geo-enrich` and `entity-graph` (and the underscore spellings):
+
+| Tool | Tier | Traced arguments | Effect |
+|---|---|---|---|
+| `osint-fetch` | `lookup-infra` | `url`, `source`, `channel`, `feed`, `query`, `target` | operator-typed target: allowed; target from feed text: a human decides |
+| `geo-enrich` | `lookup-person` | all | operator-typed: allowed; from feed text: blocked |
+| `entity-graph` | `lookup-person` | all | same |
+
+`geo-enrich` is stricter here than in the OSIRIS adapter, which tiers it by what the target looks like; a JSON policy cannot express that, so it takes the safer tier. `port_scan` stays `active-probe`, `send_alert` stays `publish`, and unlisted tools are still blocked. An existing `policy.json` is never edited for you: add the rules in the policy editor, or delete the file to regenerate it.
 
 ## Collectors
 
@@ -60,6 +104,7 @@ What stays in memory regardless: pending approvals, the SSE backlog, sandbox run
 
 - `feed`: RSS 2.0 and Atom over HTTP(S).
 - `telegram-export`: a Telegram Desktop export (`result.json`). A forwarded message is attributed to the channel it was forwarded from, which is what lets ten channels forwarding one post count as one origin. Live collection through the Telegram API is not included.
+- **Live Telegram.** Set `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` (from my.telegram.org), run `npm run telegram:login -w @admiralty-gate/server` once to obtain `TELEGRAM_SESSION`, and list public channel usernames in `TELEGRAM_CHANNELS` (`name:D3,other`; the grade defaults to `F6`). The collector process holds one MTProto connection (GramJS); every `TELEGRAM_POLL_SECONDS` the server asks it, through the gate proxy, for messages newer than each channel's cursor. Each request is therefore a gated, audited `telegram_poll` call whose only trusted text is your channel list: a channel named in a message cannot be polled. Messages are ingested as untrusted items; a forward is attributed to the channel it came from. The cursor is stored, so a restart resumes where it stopped. The session string gives access to the Telegram account: keep it in `.env.local` only, and use an account you are content to dedicate to this.
 - `jsonl`: one JSON object per line with a `text`, `summary` or `title`; optional `id`, `at`, `lat`, `lon`, `place`, `claim`, `stance`.
 
 ## Ledger anomaly webhook
@@ -90,12 +135,23 @@ The same rules as the rest of the project. The fusion pipeline works on incident
 
 ## What was and was not verified
 
-Verified by tests: the core rules (mutation-checked); every server route on the in-memory backend and again on PostgreSQL 16 with PostGIS 3.4 and pgvector 0.6 plus BullMQ on Redis 7, with identical assertions; restart recovery from PostgreSQL; the webhook signature; collectors against a local HTTP feed and local files, including refusal of an unconfigured location. The three views were exercised in a headless browser against the PostgreSQL and BullMQ backend.
+Verified by tests, on the in-memory backend and again on PostgreSQL 16 (PostGIS 3.4, pgvector 0.6) with BullMQ on Redis 7:
+- Core: clustering parity against the previous pairwise implementation on 400 random inputs over every option combination; scale tests (10,000 events under 200 ms).
+- API key enforcement on every route and on the event stream over a real socket; loopback-only start without a key.
+- Stored tool calls, approvals and incident history; restart recovery from PostgreSQL, including expiry of an approval left pending.
+- Ring detection in the store: grouping, hub cap, time window, account bridging, proxy exclusion, and `ST_DWithin` proximity.
+- The HTTP embedding provider against a local OpenAI-compatible stub: dimension discovery, semantic clustering and grounding, and the vector-column rebuild when the dimension changes.
+- MaxMind reading against MaxMind's public test databases (city and ASN).
+- GeoNames parsing against a six-row sample in the real file layout; Nominatim against a local stub, with the cache.
+- The Telegram streamer end to end with the real gate, proxy, collector process, queue and store, and a **stand-in driver** in place of GramJS.
+- The dashboard in a headless browser on PostgreSQL and BullMQ: key prompt (wrong and right key), timeline restored after a reload, and the map falling back to outlines when the style URL is unreachable.
+- `docker compose config` accepts `docker-compose.yml`; the `postgis/postgis:16-3.4` base image pulls.
 
-Not verified:
-- `docker-compose.yml` and `docker/postgres/Dockerfile` were written but not run (no Docker daemon was available). The database and Redis were tested as locally installed services of the same versions.
-- The `fusion-services` CI job has not run on GitHub's runners.
-- Collectors were not run against real third-party feeds or real Telegram exports; the export parser follows the documented `result.json` layout.
-- Tool names `osint-fetch`, `geo-enrich` and `entity-graph` were tiered as requested and not checked against the upstream OSIRIS repository.
-- Throughput. Clustering is quadratic per claim and ring detection reads every ledger event on each recompute, which is fine for thousands of items and not for millions.
-- The sample gazetteer's boxes are approximate and were written from general knowledge, not from a geographic dataset.
+Not verified (the sandbox this was built in has no route to the hosts involved):
+- **The local embedding model.** `huggingface.co` was unreachable, so `Xenova/multilingual-e5-small` was never downloaded or run. The provider code follows the transformers.js API and type-checks; what was observed is its failure path (it degrades to the mock in about 4 s and reports why).
+- **The GramJS driver and the login script.** No Telegram credentials. They type-check against the `telegram` package.
+- **The PostgreSQL image build.** Debian's and PostgreSQL's apt repositories were blocked, so `postgresql-16-pgvector` could not be installed inside the image. The Dockerfile and init script were not run.
+- **OpenFreeMap tiles.** The style URL in `.env.example` could not be fetched; only the fallback was exercised.
+- **Real GeoNames and GeoLite2 files**, and the public Nominatim service.
+- **The `fusion-services` CI job** on GitHub's runners.
+- The semantic merge threshold (0.92) against a real model.

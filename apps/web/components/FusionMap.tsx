@@ -28,14 +28,25 @@ export interface FusionMapProps {
   selected: string | null;
   onSelect: (id: string | null) => void;
   onBounds?: (bbox: [number, number, number, number]) => void;
+  /** Told which base map ended up in use: the street style, or the bundled outlines (with the reason, if it was a fallback). */
+  onBase?: (base: { kind: 'street' | 'outlines'; note?: string }) => void;
 }
 
-export default function FusionMap({ incidents, heat, selected, onSelect, onBounds }: FusionMapProps) {
+/** Fetch the street style first, with a short timeout, so that an unreachable tile host falls back cleanly. */
+async function loadStyle(url: string): Promise<StyleSpecification> {
+  const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const style = (await res.json()) as StyleSpecification;
+  if (style.version !== 8 || !Array.isArray(style.layers)) throw new Error('not a MapLibre style');
+  return style;
+}
+
+export default function FusionMap({ incidents, heat, selected, onSelect, onBounds, onBase }: FusionMapProps) {
   const el = useRef<HTMLDivElement>(null);
   const map = useRef<MlMap | null>(null);
   const ready = useRef(false);
-  const latest = useRef({ incidents, heat, selected, onSelect, onBounds });
-  latest.current = { incidents, heat, selected, onSelect, onBounds };
+  const latest = useRef({ incidents, heat, selected, onSelect, onBounds, onBase });
+  latest.current = { incidents, heat, selected, onSelect, onBounds, onBase };
 
   const push = () => {
     const m = map.current;
@@ -52,15 +63,44 @@ export default function FusionMap({ incidents, heat, selected, onSelect, onBound
 
   useEffect(() => {
     if (!el.current) return;
+    let cancelled = false;
+    let m: MlMap | undefined;
     const styleUrl = process.env.NEXT_PUBLIC_MAP_STYLE_URL;
     // Served from public/ (copied there by scripts/copy-map-worker.mjs).
     maplibregl.setWorkerUrl('/maplibre-gl-worker.mjs');
-    const m = new maplibregl.Map({ container: el.current, style: styleUrl || BASE, center: [33.6, 33.6], zoom: 5.4, attributionControl: false, maxZoom: 14 });
+    (async () => {
+      let style: StyleSpecification = BASE;
+      let street = false;
+      if (styleUrl) {
+        try {
+          style = await loadStyle(styleUrl);
+          street = true;
+        } catch (e) {
+          latest.current.onBase?.({ kind: 'outlines', note: `street map unreachable (${(e as Error).message}); showing bundled outlines` });
+        }
+      }
+      if (!styleUrl) latest.current.onBase?.({ kind: 'outlines' });
+      if (street) latest.current.onBase?.({ kind: 'street' });
+      if (cancelled || !el.current) return;
+      m = build(el.current, style, street);
+    })();
+    return () => {
+      cancelled = true;
+      ready.current = false;
+      m?.remove();
+      map.current = null;
+    };
+    // The map is created once; data flows in through `push`.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const build = (container: HTMLDivElement, style: StyleSpecification, street: boolean): MlMap => {
+    const m = new maplibregl.Map({ container, style, center: [33.6, 33.6], zoom: 5.4, attributionControl: false, maxZoom: street ? 18 : 14 });
     map.current = m;
     m.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
-    m.addControl(new maplibregl.AttributionControl({ compact: true, customAttribution: styleUrl ? undefined : 'Outlines: Natural Earth' }));
+    m.addControl(new maplibregl.AttributionControl({ compact: true, ...(street ? {} : { customAttribution: 'Outlines: Natural Earth' }) }));
     m.on('load', async () => {
-      if (!styleUrl) {
+      if (!street) {
         const [{ feature }, topo] = await Promise.all([import('topojson-client'), import('world-atlas/countries-50m.json')]);
         const t = (topo as unknown as { default: never }).default;
         (m.getSource('land') as GeoJSONSource | undefined)?.setData(feature(t, (t as { objects: { countries: never } }).objects.countries) as never);
@@ -98,14 +138,8 @@ export default function FusionMap({ incidents, heat, selected, onSelect, onBound
       bounds();
       push();
     });
-    return () => {
-      ready.current = false;
-      m.remove();
-      map.current = null;
-    };
-    // The map is created once; data flows in through `push`.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    return m;
+  };
 
   useEffect(push, [incidents, heat, selected]);
 

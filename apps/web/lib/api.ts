@@ -6,12 +6,40 @@ export class ApiError extends Error {
   }
 }
 
+const KEY_SLOT = 'admiralty-api-key';
+
+/**
+ * The API key, when the server requires one. It is typed in by the operator and kept for this browser tab only
+ * (sessionStorage): it is never baked into the page bundle, where anyone who can load the page could read it.
+ */
+export function getApiKey(): string {
+  try {
+    return window.sessionStorage.getItem(KEY_SLOT) ?? '';
+  } catch {
+    return '';
+  }
+}
+export function setApiKey(key: string): void {
+  try {
+    if (key) window.sessionStorage.setItem(KEY_SLOT, key);
+    else window.sessionStorage.removeItem(KEY_SLOT);
+  } catch {
+    /* storage unavailable: the key lives for this page load only */
+  }
+  window.dispatchEvent(new Event('admiralty-key-changed'));
+}
+export const authHeaders = (): Record<string, string> => {
+  const k = typeof window === 'undefined' ? '' : getApiKey();
+  return k ? { authorization: `Bearer ${k}` } : {};
+};
+
 export async function api<T>(path: string, init?: { method?: 'GET' | 'POST' | 'PUT'; body?: unknown }): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${API}${path}`, {
       method: init?.method ?? 'GET',
-      ...(init?.body !== undefined ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(init.body) } : {}),
+      headers: { ...authHeaders(), ...(init?.body !== undefined ? { 'content-type': 'application/json' } : {}) },
+      ...(init?.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
     });
   } catch {
     throw new ApiError(0, `Cannot reach the gate server at ${API}. Is "npm run dev" running?`);
@@ -50,7 +78,7 @@ export interface Providers { anthropic: boolean; openai: boolean; anthropicModel
 export interface AuditEntry { seq: number; at?: number; kind?: string; data?: Record<string, unknown>; prev?: string; hash?: string; unparseable?: string }
 export interface AuditView { entries: AuditEntry[]; chainValid: boolean; brokenAt?: number; reason?: string; head: string | null; file?: string; quarantined?: { file: string; brokenAt: number; reason: string } }
 export interface GroundedSentence {
-  text: string; status: string; level: 'operator' | 'verified' | 'single' | 'weak' | 'ungrounded'; overlap: number;
+  text: string; status: string; level: 'operator' | 'verified' | 'single' | 'paraphrase' | 'weak' | 'ungrounded'; semanticScore?: number; overlap: number;
   support: { spanId: string; origin: { id: string; kind: string }; overlap: number }[]; independentOrigins: number;
   bestGrade?: string; unsupportedSpecifics: string[]; fromFlaggedSource: boolean;
 }
@@ -89,7 +117,7 @@ export interface AchResponse {
   };
   attribution: { allowed: boolean; reasons: string[]; leader: string };
 }
-export interface FusionStatus { store: string; queue: string; items: number; claims: number; geoipRows: number; ledgerWebhook: boolean }
+export interface FusionStatus { store: string; queue: string; items: number; claims: number; geoipRows: number; ledgerWebhook: boolean; embedding?: { provider: string; dim: number; semantic: boolean; degraded?: string }; geoip?: { sources: string[] }; gazetteer?: { sources: string[] } }
 
 /** Status colours: validated as a set against the dark surface for colour-vision deficiency; always paired with a shape and a label. */
 export const STATUS: Record<IncidentStatus, { color: string; label: string; hint: string }> = {

@@ -45,7 +45,7 @@ All five sandbox tools return canned text. No lookup, scan or alert is ever perf
 
 ## Security notes
 
-- Loopback only by default, no authentication, and it can approve tool calls and rewrite the policy. Treat it like a debugger, not a service.
+- Loopback only by default. Set `ADMIRALTY_API_KEY` to require a key on every `/api` route and on `/events`; the server will not start on a non-loopback address without one. A single shared key is not user management.
 - State-changing requests carrying an `Origin` other than the dashboard's are refused, so a web page on another site cannot click "Approve" through your browser. CORS responses are limited to the same origins (`WEB_ORIGIN`).
 - An audit file that fails verification at start-up is renamed to `audit.jsonl.broken-<timestamp>` and a new chain starts with a record saying so. The server never appends to a broken chain.
 - An invalid `policy.json` stops the server at start-up.

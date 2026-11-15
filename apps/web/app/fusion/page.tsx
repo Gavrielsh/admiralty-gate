@@ -32,6 +32,7 @@ export default function FusionPage() {
   const [inView, setInView] = useState(false);
   const bounds = useRef<[number, number, number, number] | null>(null);
   const [viewTick, setViewTick] = useState(0);
+  const [base, setBase] = useState<{ kind: 'street' | 'outlines'; note?: string } | null>(null);
 
   const load = useCallback(async () => {
     const q = new URLSearchParams();
@@ -90,8 +91,10 @@ export default function FusionPage() {
           <h1 className="text-lg font-semibold">Fusion map</h1>
           <p className="max-w-3xl text-xs text-muted">Incidents are placed only after their evidence has been clustered by independent origin and put through the release rule. A released incident and a quarantined one never look alike.</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
           {status && <Badge title="Where provenance is stored and how jobs are queued">{status.store} · {status.queue} · {status.items} items</Badge>}
+          {status?.embedding && <Badge tone={status.embedding.degraded ? 'amber' : 'gray'} title={status.embedding.degraded ?? (status.embedding.semantic ? 'Semantic embeddings' : 'Lexical embeddings: similar spelling, not similar meaning')}>{status.embedding.degraded ? 'embeddings degraded' : status.embedding.provider}</Badge>}
+          {base?.note && <Badge tone="amber" title={base.note}>offline map</Badge>}
           <Button onClick={load}>Refresh</Button>
           <Button tone="cyan" disabled={busy} onClick={seed} title="Loads an invented scenario: one corroborated event, one manufactured story, two fraud rings">{busy ? 'Loading…' : 'Load demo scenario'}</Button>
         </div>
@@ -132,7 +135,7 @@ export default function FusionPage() {
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
         <section className="relative h-[560px] overflow-hidden rounded-lg border border-line bg-panel xl:h-[680px]">
-          <FusionMap incidents={incidents} heat={heat} selected={selected} onSelect={setSelected}
+          <FusionMap incidents={incidents} heat={heat} selected={selected} onSelect={setSelected} onBase={setBase}
             onBounds={b => { bounds.current = b; if (inView) setViewTick(t => t + 1); }} />
           <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-line bg-panel/90 p-2.5 text-[11px] backdrop-blur">
             <div className="mb-1.5 font-semibold uppercase tracking-wider text-muted">Legend</div>

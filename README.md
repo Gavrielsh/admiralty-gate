@@ -62,6 +62,17 @@ npm run dev
 
 Set `POSTGRES_PASSWORD`, `DATABASE_URL` and `REDIS_URL` in `.env.local` first (the example file shows the shape). The server creates its tables and the `postgis` and `vector` extensions on first start.
 
+Everything else is switched on from the same file; `.env.example` lists every variable.
+
+| To get | Set in `.env.local` |
+|---|---|
+| A login for the API and dashboard | `ADMIRALTY_API_KEY`. Required before `HOST` can be anything but loopback. The dashboard asks for the key and keeps it for the browser tab. |
+| Multilingual semantic embeddings | nothing: `EMBEDDING_PROVIDER=local` is the default and downloads `Xenova/multilingual-e5-small` once. Or `EMBEDDING_PROVIDER=http` with `EMBEDDING_API_URL`. `mock` is the lexical stand-in. |
+| IP geolocation | `MAXMIND_CITY_DB_PATH` (and `MAXMIND_ASN_DB_PATH`) pointing at GeoLite2 `.mmdb` files you downloaded from MaxMind |
+| Real place-name resolution | `GEONAMES_TSV_PATH` pointing at a GeoNames `cities15000.txt`, and/or `NOMINATIM_URL` |
+| Live Telegram collection | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION`, `TELEGRAM_CHANNELS` |
+| A street-level map | `NEXT_PUBLIC_MAP_STYLE_URL` (set in the example file; falls back to bundled outlines offline) |
+
 | Route | Purpose |
 |---|---|
 | `POST /api/ingest` | Register items as **untrusted** provenance with an Admiralty grade (`F6` if none given). Queued: de-duplicate, geo-enrich, cluster. |
@@ -69,6 +80,8 @@ Set `POSTGRES_PASSWORD`, `DATABASE_URL` and `REDIS_URL` in `.env.local` first (t
 | `POST /api/corroborate` | `clusterItems` + `corroborate` + `canRelease` for a stored claim or ad-hoc evidence: independent clusters, noisy-OR, echo reduction, release decision. |
 | `POST /api/ach` | Deterministic ACH with critical evidence and an attribution gate. |
 | `GET /api/geo/incidents`, `GET /api/geo/heatmap` | GeoJSON for the map; filter by `released`, `minGrade`, `since`/`until`, `bbox`, `kind`. |
+| `GET /api/calls`, `GET /api/approvals/history`, `GET /api/incidents/:id/history` | Stored records: tool calls, approvals with their outcome, how an incident's status changed. |
+| `GET /api/telegram/status`, `POST /api/telegram/poll` | The live Telegram collector. |
 | `POST /api/ingest/ledger` | HMAC-signed webhook for ledger/session anomaly events (IP, proxy flag, ASN, wallet, device). |
 | `GET /api/collectors`, `POST /api/collectors/run` | Operator-configured feeds, Telegram exports and JSONL files, fetched by an MCP collector behind `McpGateProxy`. |
 
@@ -140,7 +153,7 @@ The library lives in `packages/core`; `apps/server` and `apps/web` are the conso
 
 ```bash
 npm install
-npm test                    # 123 core tests + 54 server tests (63 with TEST_DATABASE_URL and TEST_REDIS_URL set)
+npm test                    # 130 core tests + 79 server tests (98 with TEST_DATABASE_URL and TEST_REDIS_URL set)
 npm run build               # core, server, web
 npm run redteam             # regenerate RESULTS.md
 cd packages/core

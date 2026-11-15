@@ -4,7 +4,8 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import type { ReactNode } from 'react';
 import { useGate } from '@/lib/events';
-import { API } from '@/lib/api';
+import { useState } from 'react';
+import { API, getApiKey, setApiKey } from '@/lib/api';
 import { cx } from './ui';
 
 const NAV = [
@@ -19,7 +20,8 @@ const NAV = [
 
 export function Shell({ children }: { children: ReactNode }) {
   const path = usePathname();
-  const { connected, approvals } = useGate();
+  const { connected, approvals, authRequired } = useGate();
+  const [key, setKey] = useState('');
   return (
     <div className="flex min-h-screen flex-col lg:flex-row">
       <aside className="shrink-0 border-b border-line bg-panel lg:sticky lg:top-0 lg:h-screen lg:w-60 lg:border-b-0 lg:border-r">
@@ -59,7 +61,16 @@ export function Shell({ children }: { children: ReactNode }) {
         </div>
       </aside>
       <main className="min-w-0 flex-1 p-4 lg:p-6">
-        {!connected && (
+        {authRequired && (
+          <form className="mb-4 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-3 text-xs text-amber-100" onSubmit={e => { e.preventDefault(); setApiKey(key.trim()); setKey(''); }}>
+            <p className="mb-2"><b>This server requires an API key.</b> Enter the value of <span className="font-mono">ADMIRALTY_API_KEY</span>{getApiKey() ? ' (the one in this tab was refused)' : ''}. It is kept for this browser tab only.</p>
+            <div className="flex max-w-xl gap-2">
+              <input type="password" autoComplete="off" aria-label="API key" value={key} onChange={e => setKey(e.target.value)} className="w-full rounded-md border border-line bg-canvas px-2.5 py-1.5 font-mono text-[13px] text-text" placeholder="API key" />
+              <button type="submit" disabled={!key.trim()} className="rounded-md border border-amber-500/60 bg-amber-500/20 px-3 py-1.5 font-medium disabled:opacity-40">Connect</button>
+            </div>
+          </form>
+        )}
+        {!connected && !authRequired && (
           <p role="status" className="mb-4 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
             Not connected to the gate server at <span className="font-mono">{API}</span>. Start it with <span className="font-mono">npm run dev</span>; this page reconnects by itself.
           </p>

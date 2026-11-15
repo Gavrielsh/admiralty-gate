@@ -4,10 +4,10 @@
  */
 import pg from 'pg';
 import { parseGrade } from 'admiralty-gate';
-import { EMBED_DIM } from './embed.js';
-import type { AuditMirrorRow, BBox, FusionItem, HeatCell, HeatQuery, Incident, IncidentQuery, ItemQuery, Store } from './types.js';
+import type { Place } from 'admiralty-gate';
+import type { ApprovalRow, ApprovalState, AuditMirrorRow, BBox, CallRow, FusionItem, HeatCell, HeatQuery, Incident, IncidentQuery, IncidentSnapshot, IndicatorGroup, ItemQuery, Store } from './types.js';
 
-const SCHEMA = `
+const schemaSql = (dim: number): string => `
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS fusion_items (
@@ -23,11 +23,13 @@ CREATE TABLE IF NOT EXISTS fusion_items (
   proxy boolean NOT NULL DEFAULT false,
   doc jsonb NOT NULL,
   geom geography(Point, 4326),
-  embedding vector(${EMBED_DIM})
+  embedding vector(${dim})
 );
 CREATE INDEX IF NOT EXISTS fusion_items_geom ON fusion_items USING gist (geom);
 CREATE INDEX IF NOT EXISTS fusion_items_claim ON fusion_items (claim);
 CREATE INDEX IF NOT EXISTS fusion_items_at ON fusion_items (at);
+CREATE INDEX IF NOT EXISTS fusion_items_kind_at ON fusion_items (kind, at);
+CREATE INDEX IF NOT EXISTS fusion_items_source ON fusion_items (source_id);
 CREATE INDEX IF NOT EXISTS fusion_items_embedding ON fusion_items USING hnsw (embedding vector_cosine_ops);
 CREATE TABLE IF NOT EXISTS fusion_indicators (
   item_id text NOT NULL REFERENCES fusion_items (id) ON DELETE CASCADE,
@@ -55,7 +57,25 @@ CREATE TABLE IF NOT EXISTS audit_mirror (
   kind text NOT NULL,
   at timestamptz NOT NULL,
   data jsonb
-);`;
+);
+CREATE TABLE IF NOT EXISTS call_records (id text PRIMARY KEY, at timestamptz NOT NULL, doc jsonb NOT NULL);
+CREATE INDEX IF NOT EXISTS call_records_at ON call_records (at DESC);
+CREATE TABLE IF NOT EXISTS approvals (
+  id text PRIMARY KEY,
+  state text NOT NULL,
+  requested_at timestamptz NOT NULL,
+  doc jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS approvals_state ON approvals (state, requested_at DESC);
+CREATE TABLE IF NOT EXISTS fusion_incident_history (
+  seq bigserial PRIMARY KEY,
+  incident_id text NOT NULL,
+  at timestamptz NOT NULL,
+  doc jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fusion_incident_history_id ON fusion_incident_history (incident_id, seq);
+CREATE TABLE IF NOT EXISTS geocode_cache (query text PRIMARY KEY, place jsonb, cached_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS kv (key text PRIMARY KEY, value text NOT NULL);`;
 
 const point = (g: { lat: number; lon: number } | undefined): string | null => (g ? `SRID=4326;POINT(${g.lon} ${g.lat})` : null);
 const ts = (ms: number): Date => new Date(ms);
@@ -94,9 +114,22 @@ export class PgStore implements Store {
     this.pool = new pg.Pool({ connectionString, max: 8, ...(schema ? { options: `-c search_path=${schema},public` } : {}) });
   }
 
-  async init(): Promise<void> {
+  async init(dim: number): Promise<{ reembed: boolean }> {
+    if (!Number.isInteger(dim) || dim < 1 || dim > 2000) throw new Error(`embedding dimension ${dim} is outside what pgvector's HNSW index supports (1-2000)`);
     if (this.schema) await this.pool.query(`CREATE SCHEMA IF NOT EXISTS ${this.schema}`);
-    await this.pool.query(SCHEMA);
+    await this.pool.query(schemaSql(dim));
+    // A different embedding model has a different vector length: old vectors are meaningless to it, so the column
+    // is rebuilt and the caller re-embeds every item.
+    const cur = await this.pool.query<{ dim: number }>(
+      "SELECT a.atttypmod AS dim FROM pg_attribute a WHERE a.attrelid = to_regclass('fusion_items') AND a.attname = 'embedding'",
+    );
+    if (cur.rows[0] && cur.rows[0].dim !== dim) {
+      await this.pool.query('DROP INDEX IF EXISTS fusion_items_embedding');
+      await this.pool.query(`ALTER TABLE fusion_items DROP COLUMN embedding, ADD COLUMN embedding vector(${dim})`);
+      await this.pool.query('CREATE INDEX IF NOT EXISTS fusion_items_embedding ON fusion_items USING hnsw (embedding vector_cosine_ops)');
+      return { reembed: true };
+    }
+    return { reembed: false };
   }
 
   async close(): Promise<void> {
@@ -149,6 +182,78 @@ export class PgStore implements Store {
   async getItem(id: string): Promise<FusionItem | undefined> {
     const r = await this.pool.query<{ doc: FusionItem }>('SELECT doc FROM fusion_items WHERE id = $1', [id]);
     return r.rows[0]?.doc;
+  }
+
+  async getItems(ids: readonly string[]): Promise<FusionItem[]> {
+    if (!ids.length) return [];
+    const r = await this.pool.query<{ doc: FusionItem }>('SELECT doc FROM fusion_items WHERE id = ANY($1::text[])', [ids]);
+    const by = new Map(r.rows.map(x => [x.doc.id, x.doc]));
+    return ids.map(i => by.get(i)).filter((x): x is FusionItem => !!x);
+  }
+
+  async setEmbedding(id: string, embedding: number[]): Promise<void> {
+    await this.pool.query('UPDATE fusion_items SET embedding = $2::vector WHERE id = $1', [id, `[${embedding.join(',')}]`]);
+  }
+
+  async pageItems(afterId: string, limit: number): Promise<{ id: string; text: string }[]> {
+    return (await this.pool.query<{ id: string; text: string }>("SELECT id, doc->>'text' AS text FROM fusion_items WHERE id > $1 ORDER BY id LIMIT $2", [afterId, limit])).rows;
+  }
+
+  async similarPairs(claim: string, minScore: number, limit = 5000): Promise<{ a: string; b: string; score: number }[]> {
+    const r = await this.pool.query<{ a: string; b: string; score: number }>(
+      `SELECT a.id AS a, b.id AS b, 1 - (a.embedding <=> b.embedding) AS score
+       FROM fusion_items a JOIN fusion_items b ON b.claim = a.claim AND a.id < b.id
+       WHERE a.claim = $1 AND a.embedding IS NOT NULL AND b.embedding IS NOT NULL AND 1 - (a.embedding <=> b.embedding) >= $2
+       ORDER BY a.id, b.id LIMIT $3`,
+      [claim, minScore, limit],
+    );
+    return r.rows.map(x => ({ a: x.a, b: x.b, score: Number(x.score) }));
+  }
+
+  /** The grouping, the two-account rule and the hub cap all run in SQL; only linked events come back. */
+  async sharedIndicatorGroups(q: { since?: number; kinds: readonly string[]; maxHolders: number }): Promise<IndicatorGroup[]> {
+    const r = await this.pool.query<{ key: string; ids: string[] }>(
+      `SELECT x.key, array_agg(i.id ORDER BY i.at, i.id) AS ids
+       FROM fusion_indicators x JOIN fusion_items i ON i.id = x.item_id
+       WHERE x.structural AND i.kind = 'ledger' AND split_part(x.key, ':', 1) = ANY($1::text[]) AND ($2::timestamptz IS NULL OR i.at >= $2)
+       GROUP BY x.key
+       HAVING count(DISTINCT i.source_id) >= 2 AND count(*) <= $3
+       ORDER BY x.key`,
+      [q.kinds, q.since === undefined ? null : ts(q.since), q.maxHolders],
+    );
+    return r.rows.map(x => ({ key: x.key, itemIds: x.ids }));
+  }
+
+  async accountEvents(accounts: readonly string[], since?: number): Promise<IndicatorGroup[]> {
+    if (!accounts.length) return [];
+    const r = await this.pool.query<{ key: string; ids: string[] }>(
+      `SELECT source_id AS key, array_agg(id ORDER BY at, id) AS ids FROM fusion_items
+       WHERE kind = 'ledger' AND source_id = ANY($1::text[]) AND ($2::timestamptz IS NULL OR at >= $2)
+       GROUP BY source_id HAVING count(*) >= 2`,
+      [accounts, since === undefined ? null : ts(since)],
+    );
+    return r.rows.map(x => ({ key: x.key, itemIds: x.ids }));
+  }
+
+  /** PostGIS spatial self-join on the geography column (uses the GiST index), restricted by time. */
+  async proximityPairs(q: { since?: number; radiusM: number; windowMs: number; limit?: number }): Promise<[string, string][]> {
+    const r = await this.pool.query<{ a: string; b: string }>(
+      `SELECT a.id AS a, b.id AS b
+       FROM fusion_items a JOIN fusion_items b
+         ON a.id < b.id AND b.kind = 'ledger' AND a.source_id <> b.source_id
+        AND ST_DWithin(a.geom, b.geom, $1)
+        AND abs(extract(epoch FROM (a.at - b.at))) * 1000 <= $2
+       WHERE a.kind = 'ledger' AND a.geom IS NOT NULL AND b.geom IS NOT NULL
+         AND ($3::timestamptz IS NULL OR (a.at >= $3 AND b.at >= $3))
+       ORDER BY a.id, b.id LIMIT $4`,
+      [q.radiusM, q.windowMs, q.since === undefined ? null : ts(q.since), q.limit ?? 20_000],
+    );
+    return r.rows.map(x => [x.a, x.b]);
+  }
+
+  async countLedger(since?: number): Promise<number> {
+    const r = await this.pool.query<{ n: string }>("SELECT count(*) AS n FROM fusion_items WHERE kind = 'ledger' AND ($1::timestamptz IS NULL OR at >= $1)", [since === undefined ? null : ts(since)]);
+    return Number(r.rows[0]!.n);
   }
 
   async queryItems(q: ItemQuery): Promise<FusionItem[]> {
@@ -256,5 +361,63 @@ export class PgStore implements Store {
       'SELECT count(*) AS n, (SELECT hash FROM audit_mirror ORDER BY seq DESC LIMIT 1) AS head FROM audit_mirror',
     );
     return { count: Number(r.rows[0]!.n), head: r.rows[0]!.head };
+  }
+
+  async putCall(row: CallRow): Promise<void> {
+    await this.pool.query('INSERT INTO call_records (id, at, doc) VALUES ($1,$2,$3) ON CONFLICT (id) DO UPDATE SET at = EXCLUDED.at, doc = EXCLUDED.doc', [row.id, ts(row.at), JSON.stringify(row.doc)]);
+  }
+
+  async listCalls(limit: number): Promise<CallRow[]> {
+    const r = await this.pool.query<{ id: string; at: Date; doc: unknown }>('SELECT id, at, doc FROM call_records ORDER BY at DESC, id DESC LIMIT $1', [limit]);
+    return r.rows.map(x => ({ id: x.id, at: x.at.getTime(), doc: x.doc }));
+  }
+
+  async putApproval(row: ApprovalRow): Promise<void> {
+    await this.pool.query(
+      'INSERT INTO approvals (id, state, requested_at, doc) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, doc = EXCLUDED.doc',
+      [row.id, row.state, ts(row.requestedAt), JSON.stringify(row)],
+    );
+  }
+
+  async listApprovals(q: { state?: ApprovalState; limit?: number }): Promise<ApprovalRow[]> {
+    const r = await this.pool.query<{ doc: ApprovalRow }>(
+      'SELECT doc FROM approvals WHERE ($1::text IS NULL OR state = $1) ORDER BY requested_at DESC, id DESC LIMIT $2',
+      [q.state ?? null, q.limit ?? 200],
+    );
+    return r.rows.map(x => x.doc);
+  }
+
+  async expirePendingApprovals(note: string, at: number): Promise<number> {
+    const r = await this.pool.query(
+      `UPDATE approvals SET state = 'expired', doc = doc || jsonb_build_object('state', 'expired', 'resolvedAt', $2::bigint, 'note', $1::text) WHERE state = 'pending'`,
+      [note, at],
+    );
+    return r.rowCount ?? 0;
+  }
+
+  async appendIncidentHistory(id: string, s: IncidentSnapshot): Promise<void> {
+    await this.pool.query('INSERT INTO fusion_incident_history (incident_id, at, doc) VALUES ($1,$2,$3)', [id, ts(s.at), JSON.stringify(s)]);
+  }
+
+  async incidentHistory(id: string): Promise<IncidentSnapshot[]> {
+    return (await this.pool.query<{ doc: IncidentSnapshot }>('SELECT doc FROM fusion_incident_history WHERE incident_id = $1 ORDER BY seq', [id])).rows.map(x => x.doc);
+  }
+
+  async getGeocode(query: string): Promise<{ hit: boolean; place?: Place }> {
+    const r = await this.pool.query<{ place: Place | null }>('SELECT place FROM geocode_cache WHERE query = $1', [query]);
+    if (!r.rows[0]) return { hit: false };
+    return r.rows[0].place ? { hit: true, place: r.rows[0].place } : { hit: true };
+  }
+
+  async putGeocode(query: string, place: Place | undefined): Promise<void> {
+    await this.pool.query('INSERT INTO geocode_cache (query, place) VALUES ($1,$2) ON CONFLICT (query) DO UPDATE SET place = EXCLUDED.place, cached_at = now()', [query, place ? JSON.stringify(place) : null]);
+  }
+
+  async getKv(key: string): Promise<string | undefined> {
+    return (await this.pool.query<{ value: string }>('SELECT value FROM kv WHERE key = $1', [key])).rows[0]?.value;
+  }
+
+  async putKv(key: string, value: string): Promise<void> {
+    await this.pool.query('INSERT INTO kv (key, value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', [key, value]);
   }
 }

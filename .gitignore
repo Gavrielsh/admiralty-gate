@@ -9,3 +9,4 @@ next-env.d.ts
 packages/core/README.md
 packages/core/LICENSE
 apps/web/public/maplibre-gl-worker.mjs
+apps/server/test/data/*.mmdb

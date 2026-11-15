@@ -5,6 +5,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildApp, type App, type AppOptions } from '../src/app.js';
+import { MockEmbedding } from '../src/fusion/embedding.js';
 import { runBridge } from '../src/bridge.js';
 import type { GateEvent } from '../src/bus.js';
 import type { CallRecord } from '../src/calls.js';
@@ -15,7 +16,7 @@ import { DEFAULT_POLICY } from '../src/sandbox/tools.js';
 const apps: App[] = [];
 async function mk(opts: Partial<AppOptions> = {}): Promise<App & { dir: string }> {
   const dir = opts.dataDir ?? mkdtempSync(join(tmpdir(), 'ag-srv-'));
-  const app = await buildApp({ dataDir: dir, stepDelayMs: 0, env: {}, ...opts });
+  const app = await buildApp({ dataDir: dir, stepDelayMs: 0, env: {}, embedding: new MockEmbedding(), ...opts });
   apps.push(app);
   return { ...app, dir };
 }

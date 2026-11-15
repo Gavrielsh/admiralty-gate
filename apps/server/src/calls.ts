@@ -40,14 +40,21 @@ const clip = (s: string, n = 400): string => (s.length > n ? `${s.slice(0, n)}..
 
 export class CallTracker {
   private n = 0;
-  constructor(private readonly bus: EventBus, private readonly clock: () => number = () => Date.now()) {}
+  constructor(
+    private readonly bus: EventBus,
+    private readonly clock: () => number = () => Date.now(),
+    private readonly idPrefix = 'call_',
+    /** Called with the record every time it changes, so it can be stored. */
+    private readonly onChange: (rec: CallRecord) => void = () => undefined,
+  ) {}
 
   intercept(sessionId: string, source: CallRecord['source'], call: ToolCall): CallRecord {
     const rec: CallRecord = {
-      id: `call_${++this.n}`, sessionId, source, at: this.clock(), tool: call.tool, args: call.args,
+      id: `${this.idPrefix}${++this.n}`, sessionId, source, at: this.clock(), tool: call.tool, args: call.args,
       reasons: [], provenance: [], hostChecks: [], status: 'intercepted',
     };
     this.bus.emit('tool.intercepted', { call: rec });
+    this.onChange(rec);
     return rec;
   }
 
@@ -82,11 +89,13 @@ export class CallTracker {
         }
     }
     this.bus.emit('tool.decision', { call: rec });
+    this.onChange(rec);
   }
 
   finish(rec: CallRecord, executed: boolean, result?: string): void {
     rec.status = executed ? 'executed' : 'blocked';
     if (result !== undefined) rec.result = clip(result);
     this.bus.emit(executed ? 'tool.executed' : 'tool.blocked', { call: rec });
+    this.onChange(rec);
   }
 }

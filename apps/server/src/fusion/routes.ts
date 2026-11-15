@@ -7,7 +7,8 @@ import {
 } from 'admiralty-gate';
 import { parseCollectorConfig, runCollector, type CollectorSource } from '../collectors/runner.js';
 import { DEMO_GEOIP, demoItems, demoLedger } from './demo.js';
-import type { GeoIpTable } from './geoip.js';
+import type { EmbeddingProvider } from './embedding.js';
+import type { IpResolver, PlaceResolver } from './georesolve.js';
 import { FusionService, ValidationError, ledgerToRaw, parseLedgerEvent, parseRawItem, type CorroborateRequest, type RawItem } from './service.js';
 import type { BBox, Incident, Store } from './types.js';
 
@@ -17,10 +18,12 @@ export interface FusionRouteContext {
   fusion: FusionService;
   store: Store;
   audit: AuditLog;
-  geoip: GeoIpTable;
+  ips: IpResolver;
+  places: PlaceResolver;
+  embedding: EmbeddingProvider;
+  embeddingDegraded?: string;
   env: Record<string, string | undefined>;
   collectorsFile: string;
-  embed: (text: string) => number[];
   queueKind: string;
 }
 
@@ -81,7 +84,10 @@ export function registerFusionRoutes(app: FastifyInstance, c: FusionRouteContext
 
   app.get('/api/fusion/status', async () => ({
     store: c.store.kind, queue: c.queueKind, items: await c.store.countItems(), claims: (await c.store.claims()).length,
-    geoipRows: c.geoip.size, ledgerWebhook: Boolean(c.env.LEDGER_WEBHOOK_SECRET),
+    geoipRows: c.ips.csv.size, ledgerWebhook: Boolean(c.env.LEDGER_WEBHOOK_SECRET),
+    embedding: { provider: c.embedding.name, dim: c.embedding.dim, semantic: c.embedding.semantic, ...(c.embeddingDegraded ? { degraded: c.embeddingDegraded } : {}) },
+    geoip: { sources: c.ips.sources, notes: c.ips.notes },
+    gazetteer: { sources: c.places.sources, notes: c.places.notes },
   }));
 
   // ---- ingestion: everything is validated, graded (F6 when ungraded) and queued; nothing is trusted.
@@ -119,7 +125,7 @@ export function registerFusionRoutes(app: FastifyInstance, c: FusionRouteContext
         limit,
         ...(q.claim ? { claim: q.claim } : {}), ...(kind ? { kind } : {}), ...(sourceType ? { sourceType } : {}), ...(minGrade ? { minGrade } : {}),
         ...(since !== undefined ? { since } : {}), ...(until !== undefined ? { until } : {}), ...(bbox ? { bbox } : {}), ...(indicator ? { indicator } : {}),
-        ...(q.q ? { near: c.embed(q.q) } : {}),
+        ...(q.q ? { near: (await c.embedding.embed([q.q], 'query'))[0]! } : {}),
       });
       // Entity links: indicators carried or mentioned by two or more of the returned items.
       const idx = new Map<string, { itemIds: string[]; structural: boolean }>();
@@ -145,10 +151,11 @@ export function registerFusionRoutes(app: FastifyInstance, c: FusionRouteContext
       if (typeof b.claim !== 'string' || !b.claim.trim()) throw new BadRequest('"claim" (the incident key) is required');
       const o = isObj(b.options) ? b.options : {};
       const opts: CorroborateRequest = {};
-      if (o.indicators !== undefined) {
-        if (typeof o.indicators !== 'boolean') throw new BadRequest('options.indicators must be a boolean');
-        opts.indicators = o.indicators;
-      }
+      for (const k of ['indicators', 'semantic'] as const)
+        if (o[k] !== undefined) {
+          if (typeof o[k] !== 'boolean') throw new BadRequest(`options.${k} must be a boolean`);
+          opts[k] = o[k] as boolean;
+        }
       for (const k of ['burstWindowMs', 'proximityKm'] as const)
         if (o[k] !== undefined) {
           if (o[k] !== null && (typeof o[k] !== 'number' || !(o[k] as number > 0))) throw new BadRequest(`options.${k} must be a positive number or null`);
@@ -301,6 +308,12 @@ export function registerFusionRoutes(app: FastifyInstance, c: FusionRouteContext
     }),
   );
 
+  app.get('/api/incidents/:id/history', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    const history = await c.store.incidentHistory(id);
+    return history.length ? { id, history } : reply.code(404).send({ error: `no history for incident "${id}"` });
+  });
+
   // ---- collectors (operator-configured sources, run through the MCP gate proxy)
   const sources = (): CollectorSource[] => {
     if (!existsSync(c.collectorsFile)) writeFileSync(c.collectorsFile, JSON.stringify({ $comment: 'Collector sources. type: feed | telegram-export | jsonl. Only locations listed here can be collected.', sources: [] }, null, 2) + '\n');
@@ -363,7 +376,7 @@ export function registerFusionRoutes(app: FastifyInstance, c: FusionRouteContext
   app.post('/api/fusion/demo', async (_req, reply) => {
     if (c.env.ADMIRALTY_DEMO === '0') return reply.code(403).send({ error: 'demo data is disabled (ADMIRALTY_DEMO=0)' });
     const now = Date.now();
-    c.geoip.load(DEMO_GEOIP);
+    c.ips.csv.load(DEMO_GEOIP);
     const raws: RawItem[] = [...demoItems(now), ...demoLedger(now).map(e => ledgerToRaw(e, 'B2'))];
     const ids = await c.fusion.ingest(raws);
     await c.fusion.idle();

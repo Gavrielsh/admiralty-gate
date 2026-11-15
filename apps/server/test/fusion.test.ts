@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { buildApp, type App, type AppOptions } from '../src/app.js';
+import { MockEmbedding } from '../src/fusion/embedding.js';
 import { parseFeed, parseJsonl, parseTelegramExport } from '../src/collectors/parse.js';
 import { parseCollectorConfig, runCollector } from '../src/collectors/runner.js';
 import { cosine, hashEmbedding } from '../src/fusion/embed.js';
@@ -27,7 +28,7 @@ const pgStores: PgStore[] = [];
 async function mk(backend: (typeof backends)[number], opts: Partial<AppOptions> = {}): Promise<App & { dir: string }> {
   const dir = opts.dataDir ?? mkdtempSync(join(tmpdir(), 'ag-fusion-'));
   const b = opts.store ? {} : backend.make();
-  const app = await buildApp({ dataDir: dir, stepDelayMs: 0, env: {}, policyWatchMs: 0, ...b, ...opts });
+  const app = await buildApp({ dataDir: dir, stepDelayMs: 0, env: {}, embedding: new MockEmbedding(), policyWatchMs: 0, ...b, ...opts });
   if (app.store instanceof PgStore) pgStores.push(app.store);
   apps.push(app);
   return { ...app, dir };

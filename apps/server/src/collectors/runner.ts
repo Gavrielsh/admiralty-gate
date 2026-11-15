@@ -72,6 +72,7 @@ export const collectorGateConfig = (): GateConfig => ({
     collect_feed: { tier: 'lookup-infra', targetArgs: ['url'] },
     collect_telegram_export: { tier: 'lookup-infra', targetArgs: ['path'] },
     collect_jsonl: { tier: 'lookup-infra', targetArgs: ['path'] },
+    telegram_poll: { tier: 'lookup-infra', targetArgs: ['channel'] },
   },
   // Nobody is watching a scheduled collection run, so anything not plainly configured is refused, not queued.
   onUnknownInfra: 'deny',
@@ -101,68 +102,209 @@ export interface RunOptions {
   timeoutMs?: number;
 }
 
-export function runCollector(source: CollectorSource, o: RunOptions = {}): Promise<CollectResult> {
-  const spec = TOOL[source.type];
-  const call = o.call ?? { tool: spec.tool, args: { [spec.arg]: source.location } };
-  const cmd = o.command ?? collectorCommand();
-  const child = spawn(cmd.command, cmd.args, { stdio: ['pipe', 'pipe', 'inherit'] });
+export interface SessionCall {
+  decision: Decision;
+  /** The collector's answer (JSON text) when the gate let the call through and the collector succeeded. */
+  text?: string;
+  error?: string;
+}
 
-  return new Promise<CollectResult>(resolve => {
-    let decision: Decision | undefined;
-    let done = false;
-    const finish = (r: Omit<CollectResult, 'source' | 'decision'>) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      child.kill();
-      resolve({ source, decision: decision ?? { verdict: 'deny', tool: call.tool, tier: 'unregistered', reasons: ['no decision was reached'], traces: {} }, ...r });
-    };
-    const timer = setTimeout(() => finish({ items: [], error: 'collector timed out' }), o.timeoutMs ?? 30000);
+/**
+ * A collector child process with McpGateProxy in front of it, kept open for several calls (a live stream polls
+ * through it). Calls run one at a time. `trusted` is the only text that can authorise a target.
+ */
+export class CollectorSession {
+  private readonly child: ReturnType<typeof spawn>;
+  private readonly proxy: McpGateProxy;
+  private seq = 1;
+  private lastDecision: Decision | undefined;
+  private readonly waiting = new Map<number, (r: { isError?: boolean; text: string }) => void>();
+  private tail: Promise<unknown> = Promise.resolve();
+  private dead: string | undefined;
 
-    const proxy = new McpGateProxy({
+  constructor(o: { trusted: readonly string[]; name: string; audit?: AuditLog; command?: { command: string; args: string[] }; env?: NodeJS.ProcessEnv }) {
+    const cmd = o.command ?? collectorCommand();
+    this.child = spawn(cmd.command, cmd.args, { stdio: ['pipe', 'pipe', 'inherit'], ...(o.env ? { env: o.env } : {}) });
+    this.proxy = new McpGateProxy({
       config: collectorGateConfig(),
-      trusted: [source.location],
-      serverName: `collector:${source.id}`,
+      trusted: o.trusted,
+      serverName: `collector:${o.name}`,
       ...(o.audit ? { audit: o.audit } : {}),
       onDecision: d => {
-        decision = d;
+        this.lastDecision = d;
       },
-      toServer: m => child.stdin.write(JSON.stringify(m) + '\n'),
+      toServer: m => this.child.stdin!.write(JSON.stringify(m) + '\n'),
       toClient: (m: RpcMessage) => {
-        if (m.id !== 2) return;
+        const done = typeof m.id === 'number' ? this.waiting.get(m.id) : undefined;
+        if (!done) return;
+        this.waiting.delete(m.id as number);
         const r = (m.result ?? {}) as { isError?: boolean; content?: { text?: string }[] };
-        const text = r.content?.[0]?.text ?? '';
-        if (r.isError) return finish({ items: [], error: text });
-        let parsed: CollectedItem[];
-        try {
-          parsed = JSON.parse(text) as CollectedItem[];
-        } catch {
-          return finish({ items: [], error: 'collector returned something that is not JSON' });
-        }
-        finish({
-          items: parsed.map(c => ({
-            ...c,
-            sourceType: spec.sourceType,
-            sourceId: source.id,
-            grade: source.grade,
-            ...(c.owner ?? source.owner ? { owner: c.owner ?? source.owner! } : {}),
-            ...(c.claim ?? source.claim ? { claim: c.claim ?? source.claim! } : {}),
-          })),
-        });
+        done({ text: r.content?.[0]?.text ?? '', ...(r.isError ? { isError: true } : {}) });
       },
     });
-
-    child.on('error', e => finish({ items: [], error: `cannot start collector: ${e.message}` }));
-    child.on('exit', () => finish({ items: [], error: 'collector exited before answering' }));
-    child.stdin.on('error', () => undefined);
-    createInterface({ input: child.stdout }).on('line', line => {
+    const fail = (why: string) => {
+      this.dead = why;
+      for (const done of this.waiting.values()) done({ isError: true, text: why });
+      this.waiting.clear();
+    };
+    this.child.on('error', e => fail(`cannot start collector: ${e.message}`));
+    this.child.on('exit', () => fail('collector exited before answering'));
+    this.child.stdin!.on('error', () => undefined);
+    createInterface({ input: this.child.stdout! }).on('line', line => {
       try {
-        proxy.onServerMessage(JSON.parse(line) as RpcMessage);
+        this.proxy.onServerMessage(JSON.parse(line) as RpcMessage);
       } catch {
         /* not JSON-RPC: ignored */
       }
     });
-    proxy.onClientMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { capabilities: {} } });
-    proxy.onClientMessage({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: call.tool, arguments: call.args } });
+    this.proxy.onClientMessage({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { capabilities: {} } });
+  }
+
+  call(tool: string, args: Record<string, unknown>, timeoutMs = 30_000): Promise<SessionCall> {
+    const run = async (): Promise<SessionCall> => {
+      const none: Decision = { verdict: 'deny', tool, tier: 'unregistered', reasons: ['no decision was reached'], traces: {} };
+      if (this.dead) return { decision: none, error: this.dead };
+      const id = ++this.seq;
+      this.lastDecision = undefined;
+      const answer = new Promise<{ isError?: boolean; text: string }>(resolve => {
+        this.waiting.set(id, resolve);
+        const timer = setTimeout(() => {
+          if (this.waiting.delete(id)) resolve({ isError: true, text: 'collector timed out' });
+        }, timeoutMs);
+        timer.unref();
+      });
+      this.proxy.onClientMessage({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: tool, arguments: args } });
+      const r = await answer;
+      const decision = this.lastDecision ?? none;
+      return r.isError ? { decision, error: r.text } : { decision, text: r.text };
+    };
+    const next = this.tail.then(run, run);
+    this.tail = next;
+    return next;
+  }
+
+  close(): void {
+    this.child.kill();
+  }
+}
+
+const toRaw = (c: CollectedItem, sourceType: SourceType, sourceId: string, grade: string, owner?: string, claim?: string): RawItem => ({
+  ...c,
+  sourceType,
+  sourceId,
+  grade,
+  ...(c.owner ?? owner ? { owner: (c.owner ?? owner)! } : {}),
+  ...(c.claim ?? claim ? { claim: (c.claim ?? claim)! } : {}),
+});
+
+export async function runCollector(source: CollectorSource, o: RunOptions = {}): Promise<CollectResult> {
+  const spec = TOOL[source.type];
+  const call = o.call ?? { tool: spec.tool, args: { [spec.arg]: source.location } };
+  const session = new CollectorSession({ trusted: [source.location], name: source.id, ...(o.audit ? { audit: o.audit } : {}), ...(o.command ? { command: o.command } : {}) });
+  try {
+    const r = await session.call(call.tool, call.args, o.timeoutMs);
+    if (r.error !== undefined) return { source, decision: r.decision, items: [], error: r.error };
+    let parsed: CollectedItem[];
+    try {
+      parsed = JSON.parse(r.text ?? '') as CollectedItem[];
+    } catch {
+      return { source, decision: r.decision, items: [], error: 'collector returned something that is not JSON' };
+    }
+    return { source, decision: r.decision, items: parsed.map(c => toRaw(c, spec.sourceType, source.id, source.grade, source.owner, source.claim)) };
+  } finally {
+    session.close();
+  }
+}
+
+export interface TelegramChannel {
+  channel: string;
+  grade: string;
+}
+
+/** "chan_a:D3, chan_b" -> channels with a grade each (F6 when none is given). */
+export function parseTelegramChannels(v: string | undefined): TelegramChannel[] {
+  return (v ?? '').split(',').map(s => s.trim()).filter(Boolean).map(s => {
+    const [name, grade] = s.split(':');
+    const channel = name!.replace(/^@/, '').trim();
+    if (/[\/.\s]/.test(s) || !/^[A-Za-z][A-Za-z0-9_]{3,31}$/.test(channel)) throw new Error(`TELEGRAM_CHANNELS: "${s}" is not a public channel username`);
+    return { channel, grade: grade ? gradeString(parseGrade(grade.trim())) : 'F6' };
   });
+}
+
+export interface StreamerOptions {
+  channels: readonly TelegramChannel[];
+  ingest: (items: RawItem[]) => Promise<unknown>;
+  /** Last message id seen per channel, kept across restarts. */
+  cursor: { get(key: string): Promise<string | undefined>; put(key: string, value: string): Promise<void> };
+  audit?: AuditLog;
+  intervalMs?: number;
+  command?: { command: string; args: string[] };
+  env?: NodeJS.ProcessEnv;
+  onError?: (channel: string, error: string) => void;
+}
+
+/**
+ * Live Telegram collection. The stream is a poll: every interval, each configured channel is asked for messages
+ * newer than its cursor THROUGH the gate proxy, so each request is a gated, audited tool call and each batch of
+ * messages is untrusted provenance. The configured channel names are the only trusted text; a channel named in a
+ * message can never be polled.
+ */
+export class TelegramStreamer {
+  private session: CollectorSession | undefined;
+  private timer: NodeJS.Timeout | undefined;
+  private running = false;
+
+  constructor(private readonly o: StreamerOptions) {}
+
+  start(): void {
+    const tick = () => void this.pollOnce().catch(() => undefined);
+    this.timer = setInterval(tick, this.o.intervalMs ?? 15_000);
+    this.timer.unref();
+    tick();
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.session?.close();
+    this.session = undefined;
+  }
+
+  /** One pass over every channel. Returns how many messages were handed to ingestion. */
+  async pollOnce(only?: string, callOverride?: { tool: string; args: Record<string, unknown> }): Promise<number> {
+    if (this.running) return 0;
+    this.running = true;
+    let total = 0;
+    try {
+      this.session ??= new CollectorSession({
+        trusted: this.o.channels.map(c => c.channel), name: 'telegram',
+        ...(this.o.audit ? { audit: this.o.audit } : {}), ...(this.o.command ? { command: this.o.command } : {}), ...(this.o.env ? { env: this.o.env } : {}),
+      });
+      for (const ch of this.o.channels) {
+        if (only && ch.channel !== only) continue;
+        const key = `telegram:cursor:${ch.channel}`;
+        const afterId = Number((await this.o.cursor.get(key)) ?? 0) || 0;
+        const call = callOverride ?? { tool: 'telegram_poll', args: { channel: ch.channel, afterId, limit: 100 } };
+        const r = await this.session.call(call.tool, call.args);
+        if (r.error !== undefined) {
+          this.o.onError?.(ch.channel, r.error);
+          continue;
+        }
+        let msgs: CollectedItem[];
+        try {
+          msgs = JSON.parse(r.text ?? '[]') as CollectedItem[];
+        } catch {
+          this.o.onError?.(ch.channel, 'collector returned something that is not JSON');
+          continue;
+        }
+        if (!msgs.length) continue;
+        await this.o.ingest(msgs.map(m => toRaw(m, 'telegram', ch.channel, ch.grade)));
+        total += msgs.length;
+        const newest = Math.max(afterId, ...msgs.map(m => Number(m.externalId) || 0));
+        await this.o.cursor.put(key, String(newest));
+      }
+    } finally {
+      this.running = false;
+    }
+    return total;
+  }
 }

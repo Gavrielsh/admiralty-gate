@@ -1,0 +1,6 @@
+146384	Limassol	Limassol	Lemesos,Limassol,לימסול,ليماسول	34.68406	33.03794	P	PPLA	CY		05				154000		20	Asia/Nicosia	2023-01-01
+294801	Haifa	Haifa	Haifa,Hefa,חיפה,حيفا,HFA	32.81841	34.9885	P	PPLA	IL		04				267300		40	Asia/Jerusalem	2023-01-01
+2990440	Nice	Nice	Nice,Nizza	43.70313	7.26608	P	PPLA2	FR		93				338620		18	Europe/Paris	2023-01-01
+2639577	Reading	Reading	Reading	51.45625	-0.97113	P	PPLA2	GB		ENG				318014		61	Europe/London	2023-01-01
+5368361	Los Angeles	Los Angeles	Los Angeles,LA,לוס אנג׳לס	34.05223	-118.24368	P	PPLA2	US		CA				3971883	89	96	America/Los_Angeles	2023-01-01
+146400	Kato Drys	Kato Drys	Kato Drys	34.85	33.3	P	PPL	CY		04				130		500	Asia/Nicosia	2023-01-01

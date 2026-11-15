@@ -10,15 +10,15 @@
 import { createHash } from 'node:crypto';
 import {
   SAMPLE_GAZETTEER, canRelease, checkGeoConsistency, clusterItems, corroborate, extractCoordinates, extractEntities,
-  findPlaces, gradeString, normaliseIndicator, parseGrade, validPoint, weightOf,
+  gradeString, normaliseIndicator, parseGrade, validPoint, weightOf,
   type Assessment, type ClusterLink, type ClusterOptions, type Evidence, type GeoPoint, type Indicator, type IndicatorKind,
   type Item, type OriginKind, type Place, type ProvenanceLedger, type PublishRule, type ReleaseDecision,
 } from 'admiralty-gate';
 import type { EventBus } from '../bus.js';
-import { hashEmbedding } from './embed.js';
-import type { GeoIpTable } from './geoip.js';
+import type { EmbeddingProvider } from './embedding.js';
+import type { IpResolver, PlaceResolver } from './georesolve.js';
 import type { Handlers, JobQueue } from './queue.js';
-import { SOURCE_TYPES, type FusionItem, type Incident, type SourceType, type Store } from './types.js';
+import { SOURCE_TYPES, type FusionItem, type Incident, type IncidentSnapshot, type SourceType, type Store } from './types.js';
 
 const KINDS: readonly IndicatorKind[] = ['ip', 'cidr', 'asn', 'wallet', 'txhash', 'domain', 'phone', 'telegram', 'handle', 'email', 'device', 'account'];
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -119,9 +119,17 @@ export interface FusionOptions {
   store: Store;
   bus: EventBus;
   ledger: ProvenanceLedger;
-  geoip: GeoIpTable;
-  embed?: (text: string) => number[];
-  gazetteer?: readonly Place[];
+  embedding: EmbeddingProvider;
+  ips: IpResolver;
+  places: PlaceResolver;
+  /** Only ledger events newer than this are considered for rings. Default 7 days. */
+  ringWindowMs?: number;
+  /** Also link ledger events from different accounts within this distance (PostGIS ST_DWithin). Off by default. */
+  ringProximityKm?: number;
+  /** Time window for the proximity link. Default 10 minutes. */
+  ringProximityWindowMs?: number;
+  /** Cosine similarity above which two items of one claim count as the same post in other words. Default 0.92. */
+  semanticThreshold?: number;
   /** Accounts needed before linked ledger events are reported as a ring. Default 3. */
   minRingAccounts?: number;
   /** Window for synchronised-post linking on claims. Default 10 minutes. */
@@ -131,6 +139,8 @@ export interface FusionOptions {
 
 export interface CorroborateRequest {
   indicators?: boolean;
+  /** Use embedding similarity to merge translated or paraphrased copies posted close in time. Default: on when the provider is semantic. */
+  semantic?: boolean;
   burstWindowMs?: number | null;
   proximityKm?: number | null;
   rule?: Partial<PublishRule>;
@@ -151,13 +161,9 @@ export interface CorroborationView {
 export class FusionService {
   readonly handlers: Handlers;
   private queue!: JobQueue;
-  private readonly embed: (text: string) => number[];
-  private readonly gazetteer: readonly Place[];
   private readonly clock: () => number;
 
   constructor(private readonly o: FusionOptions) {
-    this.embed = o.embed ?? hashEmbedding;
-    this.gazetteer = o.gazetteer ?? SAMPLE_GAZETTEER;
     this.clock = o.clock ?? (() => Date.now());
     this.handlers = {
       'ingest-osint': d => this.ingestJob(d as { item: RawItem; id: string }),
@@ -228,7 +234,8 @@ export class FusionService {
       ...(r.ipGeo ? { ipGeo: r.ipGeo } : {}),
       ...(r.meta ? { meta: r.meta } : {}),
     };
-    if (!(await this.o.store.putItem(item, this.embed(item.text)))) {
+    const [vector] = await this.o.embedding.embed([item.text], 'passage');
+    if (!(await this.o.store.putItem(item, vector!))) {
       this.o.bus.emit('fusion.duplicate', { id });
       return;
     }
@@ -244,14 +251,15 @@ export class FusionService {
     if (!item) return;
     const patch: Partial<FusionItem> = {};
     let { geo, ipGeo } = item;
-    if (!ipGeo) {
-      const ip = [...item.indicators, ...(item.kind === 'ledger' ? item.mentions : [])].find(i => i.kind === 'ip');
-      const found = ip ? this.o.geoip.lookup(ip.value) : undefined;
-      if (found) ipGeo = patch.ipGeo = found;
-    }
+    const ip = [...item.indicators, ...(item.kind === 'ledger' ? item.mentions : [])].find(i => i.kind === 'ip');
+    const found = ip ? this.o.ips.lookup(ip.value) : undefined;
+    if (!ipGeo && found?.point) ipGeo = patch.ipGeo = found.point;
+    if (found?.asn && item.meta?.asn === undefined) patch.meta = { ...item.meta, asn: found.asn, ...(found.org ? { asnOrg: found.org } : {}) };
+    const places = await this.o.places.resolve(item.text, item.claimedPlace);
+    if (places.length) patch.places = places;
     if (!geo) {
       const inText = extractCoordinates(item.text)[0];
-      const named = findPlaces(item.claimedPlace ?? item.text, this.gazetteer).sort((a, b) => area(a) - area(b))[0];
+      const named = [...places].sort((a, b) => area(a) - area(b))[0];
       if (inText) [geo, patch.geoSource] = [inText, 'text'];
       else if (named) [geo, patch.geoSource] = [centre(named), 'gazetteer'];
       else if (ipGeo) [geo, patch.geoSource] = [ipGeo, 'ip'];
@@ -262,11 +270,32 @@ export class FusionService {
     if (geo && src !== 'gazetteer')
       patch.geoFlags = checkGeoConsistency(
         { point: geo, text: item.text, ...(item.claimedPlace ? { claimedPlace: item.claimedPlace } : {}), ...(ipGeo && src !== 'ip' ? { ipGeo } : {}) },
-        { gazetteer: this.gazetteer },
+        { gazetteer: places },
       );
     if (Object.keys(patch).length) await this.o.store.updateItem(id, patch);
     if (item.claim) await this.queue.add('corroborate-cluster', { claim: item.claim });
     if (item.kind === 'ledger') await this.queue.add('corroborate-cluster', { ledger: true });
+  }
+
+  /** Re-embed every stored item (after the embedding model, and so the vector length, changed). */
+  async reembedAll(): Promise<number> {
+    let after = '';
+    let n = 0;
+    for (;;) {
+      const page = await this.o.store.pageItems(after, 64);
+      if (!page.length) return n;
+      const vectors = await this.o.embedding.embed(page.map(p => p.text), 'passage');
+      for (let i = 0; i < page.length; i++) await this.o.store.setEmbedding(page[i]!.id, vectors[i]!);
+      n += page.length;
+      after = page[page.length - 1]!.id;
+    }
+  }
+
+  private async recordHistory(inc: Incident): Promise<void> {
+    const snap: IncidentSnapshot = { at: this.clock(), status: inc.status, released: inc.released, confidence: Number(inc.confidence.toFixed(4)), independentSupport: inc.independentSupport, rawItems: inc.rawItems, flags: inc.flags, reasons: inc.reasons };
+    const last = (await this.o.store.incidentHistory(inc.id)).pop();
+    const same = last && last.status === snap.status && last.independentSupport === snap.independentSupport && last.rawItems === snap.rawItems && last.flags.join('|') === snap.flags.join('|');
+    if (!same) await this.o.store.appendIncidentHistory(inc.id, snap);
   }
 
   private async clusterJob(d: { claim?: string; ledger?: boolean }): Promise<void> {
@@ -275,20 +304,28 @@ export class FusionService {
       if (view) {
         const inc = await this.claimIncident(view);
         await this.o.store.putIncident(inc);
+        await this.recordHistory(inc);
         this.o.bus.emit('incident.updated', { id: inc.id, kind: inc.kind, status: inc.status, title: inc.title });
       }
     }
     if (d.ledger) {
       const rings = await this.detectRings();
       await this.o.store.replaceIncidents('ring', rings);
+      for (const r of rings) await this.recordHistory(r);
       this.o.bus.emit('incident.updated', { kind: 'ring', count: rings.length });
     }
   }
 
-  private clusterOptions(req: CorroborateRequest = {}): ClusterOptions {
+  private clusterOptions(req: CorroborateRequest = {}, items: readonly FusionItem[] = [], pairs: readonly { a: string; b: string; score: number }[] = []): ClusterOptions {
     const burst = req.burstWindowMs === null ? undefined : (req.burstWindowMs ?? this.o.burstWindowMs ?? 600_000);
+    // The gazetteer for the core's consistency check is exactly the places already resolved for these items.
+    const places = new Map<string, Place>();
+    for (const i of items) for (const p of i.places ?? []) places.set(p.name, places.has(p.name) ? { ...p, aliases: [...new Set([...(places.get(p.name)!.aliases ?? []), ...(p.aliases ?? [])])] } : p);
     return {
-      gazetteer: this.gazetteer,
+      gazetteer: items.length ? [...places.values()] : SAMPLE_GAZETTEER,
+      // Similar meaning merges two items only when they were also posted close together: independent outlets
+      // describing the same event are similar too, and must stay independent.
+      ...(pairs.length ? { semantic: { pairs, threshold: this.o.semanticThreshold ?? 0.92, withinMs: burst ?? 600_000 } } : {}),
       // Within one claim, an indicator carried by most of the evidence IS the finding (a hub channel), so hub
       // suppression is off here. Ring detection over the whole event population keeps it on.
       ...(req.indicators === false ? {} : { indicators: { maxShare: 1 } }),
@@ -314,11 +351,13 @@ export class FusionService {
   async corroborateClaim(claim: string, req: CorroborateRequest = {}): Promise<CorroborationView | undefined> {
     const items = await this.o.store.queryItems({ claim, limit: 5000 });
     if (!items.length) return undefined;
-    return this.corroborateEvidence(claim, items.map(i => this.toEvidence(i, claim)), req, items);
+    const semantic = req.semantic ?? this.o.embedding.semantic;
+    const pairs = semantic ? await this.o.store.similarPairs(claim, this.o.semanticThreshold ?? 0.92) : [];
+    return this.corroborateEvidence(claim, items.map(i => this.toEvidence(i, claim)), req, items, pairs);
   }
 
-  corroborateEvidence(claim: string, evidence: Evidence[], req: CorroborateRequest = {}, items?: FusionItem[]): CorroborationView {
-    const assessment = corroborate(evidence, this.clusterOptions(req))[0]!;
+  corroborateEvidence(claim: string, evidence: Evidence[], req: CorroborateRequest = {}, items?: FusionItem[], pairs: readonly { a: string; b: string; score: number }[] = []): CorroborationView {
+    const assessment = corroborate(evidence, this.clusterOptions(req, items, pairs))[0]!;
     const rule = { ...({ minIndependentSupport: 2, minConfidence: 0.8, maxContradiction: 0.3, blockEchoChamber: true, blockGeoMismatch: true } satisfies PublishRule), ...req.rule };
     const clusterOf = new Map(assessment.clusters.flatMap(c => c.members.map(m => [m, c.id] as const)));
     const dist: Record<string, number> = {};
@@ -375,18 +414,41 @@ export class FusionService {
   }
 
   /**
-   * Fraud rings: ledger events from different accounts joined by a shared wallet, device or (non-proxy) IP. Template
-   * text is identical across events, so text similarity is switched off; a hub indicator (a NAT address, a big
-   * exchange wallet) is ignored by the core's hub suppression.
+   * Fraud rings: ledger events from different accounts joined by a shared wallet, device or (non-proxy) IP.
+   *
+   * The database does the heavy part: a time-window filter, GROUP BY on each structural indicator, the
+   * two-account rule and the hub cap (an indicator on more than half of the events links nothing), and optionally
+   * a PostGIS ST_DWithin self-join for events at the same place and time. Only events that are linked to something
+   * come back; the core then computes connected components over that subset.
    */
   async detectRings(): Promise<Incident[]> {
-    const events = await this.o.store.queryItems({ kind: 'ledger', limit: 20_000 });
-    if (!events.length) return [];
+    const since = this.clock() - (this.o.ringWindowMs ?? 7 * 86_400_000);
+    const total = await this.o.store.countLedger(since);
+    if (!total) return [];
+    const kinds = ['wallet', 'device', 'ip', 'account'];
+    const maxHolders = total >= 4 ? Math.max(2, Math.floor(total * 0.5)) : total;
+    const groups = await this.o.store.sharedIndicatorGroups({ since, kinds, maxHolders });
+    const near = this.o.ringProximityKm
+      ? await this.o.store.proximityPairs({ since, radiusM: this.o.ringProximityKm * 1000, windowMs: this.o.ringProximityWindowMs ?? 600_000 })
+      : [];
+    const linked = new Set<string>([...groups.flatMap(g => g.itemIds), ...near.flat()]);
+    if (!linked.size) return [];
+    let events = await this.o.store.getItems([...linked]);
+    // An account's other events belong to the same origin and can bridge two groups.
+    const mates = await this.o.store.accountEvents([...new Set(events.map(e => e.sourceId))], since);
+    const extra = mates.flatMap(m => m.itemIds).filter(i => !linked.has(i));
+    if (extra.length) events = [...events, ...(await this.o.store.getItems(extra))];
+    events.sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
     const items: Item[] = events.map(e => ({
       id: e.id, text: e.text, origin: { id: e.sourceId, kind: 'sensor' }, at: e.at, indicators: e.indicators,
       ...(e.geo ? { geo: e.geo } : {}), ...(e.ipGeo ? { ipGeo: e.ipGeo } : {}),
     }));
-    const { clusters, links } = clusterItems(items, { similarity: 2, indicators: { kinds: ['wallet', 'device', 'ip', 'account'] } });
+    // Hubs were already removed in SQL against the whole population, so the core must not re-judge them on the subset.
+    const { clusters, links } = clusterItems(items, {
+      similarity: 2,
+      indicators: { kinds: kinds as IndicatorKind[], maxShare: 1 },
+      ...(this.o.ringProximityKm ? { proximity: { radiusKm: this.o.ringProximityKm, windowMs: this.o.ringProximityWindowMs ?? 600_000 } } : {}),
+    });
     const byId = new Map(events.map(e => [e.id, e]));
     const rings: Incident[] = [];
     for (const members of clusters.values()) {
@@ -395,7 +457,7 @@ export class FusionService {
       if (accounts.size < (this.o.minRingAccounts ?? 3)) continue;
       const pts = evs.filter(e => e.geo).map(e => e.geo!);
       const inRing = new Set(members);
-      const ringLinks: ClusterLink[] = links.filter(l => l.reason === 'shared-indicator' && inRing.has(l.a) && inRing.has(l.b));
+      const ringLinks: ClusterLink[] = links.filter(l => (l.reason === 'shared-indicator' || l.reason === 'proximity') && inRing.has(l.a) && inRing.has(l.b));
       const proxies = evs.filter(e => e.meta?.proxy === true).length;
       const mismatched = evs.filter(e => e.geoFlags.length).length;
       const anchor = [...members].sort()[0]!;

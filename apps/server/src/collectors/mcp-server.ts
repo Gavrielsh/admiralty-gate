@@ -4,16 +4,18 @@
  * The server runs it behind McpGateProxy, so a URL or path that the operator did not configure is refused before
  * this process ever sees the call, and everything it returns is recorded as untrusted.
  *
- * Tools: collect_feed {url}, collect_telegram_export {path}, collect_jsonl {path}
+ * Tools: collect_feed {url}, collect_telegram_export {path}, collect_jsonl {path}, telegram_poll {channel, afterId, limit}
  */
 import { readFileSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
+import { pathToFileURL } from 'node:url';
 import { parseFeed, parseJsonl, parseTelegramExport, type CollectedItem } from './parse.js';
 
 const MAX_BYTES = 5 * 1024 * 1024;
 const TOOLS = [
   { name: 'collect_feed', description: 'Fetch an RSS or Atom feed and return its items.', inputSchema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } },
   { name: 'collect_telegram_export', description: 'Read a Telegram Desktop chat export (result.json).', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
+  { name: 'telegram_poll', description: 'Read new messages from a public Telegram channel (live, MTProto).', inputSchema: { type: 'object', properties: { channel: { type: 'string' }, afterId: { type: 'number' }, limit: { type: 'number' } }, required: ['channel'] } },
   { name: 'collect_jsonl', description: 'Read a JSON-lines file of tool output.', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
 ];
 
@@ -31,6 +33,16 @@ async function collect(name: string, args: Record<string, unknown>): Promise<Col
     const body = await res.text();
     if (body.length > MAX_BYTES) throw new Error('feed is too large');
     return parseFeed(body);
+  }
+  if (name === 'telegram_poll') {
+    // The driver is a module with fetchMessages(channel, afterId, limit). The default talks to Telegram through
+    // GramJS; ADMIRALTY_TELEGRAM_DRIVER points at another one (tests use a file-backed fake).
+    const driver = (process.env.ADMIRALTY_TELEGRAM_DRIVER
+      ? await import(pathToFileURL(process.env.ADMIRALTY_TELEGRAM_DRIVER).href)
+      : await import('./telegram-gramjs.js')) as { fetchMessages(channel: string, afterId: number, limit: number): Promise<CollectedItem[]> };
+    const afterId = Number.isInteger(args.afterId) && (args.afterId as number) > 0 ? (args.afterId as number) : 0;
+    const limit = Number.isInteger(args.limit) ? Math.min(200, Math.max(1, args.limit as number)) : 50;
+    return driver.fetchMessages(String(args.channel), afterId, limit);
   }
   if (name === 'collect_telegram_export') return parseTelegramExport(readCapped(String(args.path)));
   if (name === 'collect_jsonl') return parseJsonl(readCapped(String(args.path)));

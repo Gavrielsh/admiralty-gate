@@ -9,17 +9,19 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unwatchFile, watchFile, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  AuditLog, GuardedSession, McpGateProxy, ProvenanceLedger, groundReport, parseGrade, parsePolicy, summariseGrounding,
+  AuditLog, GuardedSession, McpGateProxy, ProvenanceLedger, SAMPLE_GAZETTEER, groundReport, sentences as splitSentences, parseGrade, parsePolicy, summariseGrounding,
   type AuditRecord, type Decision, type OriginKind, type Policy, type RpcMessage, type ToolCall,
 } from 'admiralty-gate';
 import { ApprovalQueue } from './approvals.js';
 import { EventBus, type GateEvent } from './bus.js';
 import { CallTracker, type CallRecord } from './calls.js';
-import { hashEmbedding } from './fusion/embed.js';
-import { GeoIpTable } from './fusion/geoip.js';
+import { timingSafeEqual } from 'node:crypto';
+import { chooseEmbedding, type EmbeddingProvider } from './fusion/embedding.js';
+import { IpResolver, PlaceResolver } from './fusion/georesolve.js';
 import { BullQueue, InlineQueue, type JobQueue } from './fusion/queue.js';
+import { TelegramStreamer, parseTelegramChannels } from './collectors/runner.js';
 import { registerFusionRoutes } from './fusion/routes.js';
-import { FusionService } from './fusion/service.js';
+import { FusionService, parseRawItem } from './fusion/service.js';
 import { MemoryStore } from './fusion/store.js';
 import type { Store } from './fusion/types.js';
 import { newAnthropicClient, runAnthropicAgent, runOpenAiAgent, type AnthropicLike } from './sandbox/agents.js';
@@ -43,8 +45,12 @@ export interface AppOptions {
   redisUrl?: string;
   /** BullMQ key prefix (lets test runs share a Redis). */
   queuePrefix?: string;
-  /** Text embedding of dimension 256. Default: lexical hashing (see fusion/embed.ts). */
-  embed?: (text: string) => number[];
+  /** Embedding provider. Default: chosen from EMBEDDING_PROVIDER (local model, HTTP endpoint or mock). */
+  embedding?: EmbeddingProvider;
+  /** Overrides for the live Telegram collector (tests supply a fake driver and start polls by hand). */
+  telegram?: { command?: { command: string; args: string[] }; env?: NodeJS.ProcessEnv; autoStart?: boolean };
+  /** The address the server will listen on. Anything but loopback requires ADMIRALTY_API_KEY. Default 127.0.0.1. */
+  host?: string;
   /** How often policy.json is checked for edits made outside the API. Default 1000 ms; 0 disables. */
   policyWatchMs?: number;
 }
@@ -56,6 +62,8 @@ export interface App {
   fusion: FusionService;
   store: Store;
   queue: JobQueue;
+  /** Present when TELEGRAM_CHANNELS is configured. */
+  telegram?: TelegramStreamer;
   /** Re-read policy.json now (the file watcher calls this). */
   reloadPolicy: () => void;
   /** Resolves when a sandbox run has finished (tests). */
@@ -109,16 +117,35 @@ export async function buildApp(o: AppOptions): Promise<App> {
 
   const bus = new EventBus();
   const boot = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const tracker = new CallTracker(bus);
-  const approvals = new ApprovalQueue(bus, o.approvalTimeoutMs);
+  // ---- API key. Without one the server only agrees to run on loopback.
+  const apiKey = env.ADMIRALTY_API_KEY || undefined;
+  const host = o.host ?? '127.0.0.1';
+  if (!apiKey && !['127.0.0.1', '::1', 'localhost'].includes(host))
+    throw new Error(`Refusing to listen on ${host} without ADMIRALTY_API_KEY: this API can approve tool calls and rewrite the policy.`);
+
+  // Writes to the store are queued in order and awaited on shutdown, so the record of a call or an approval is
+  // never lost to a race with the next write.
+  let storeWrites: Promise<void> = Promise.resolve();
+  const persist = (fn: () => Promise<void>) => {
+    storeWrites = storeWrites.then(fn).catch(e => void bus.emit('store.write_failed', { error: (e as Error).message.slice(0, 200) }));
+  };
 
   // ---- policy: strict, fail closed. An invalid file on disk stops the server rather than running with a guess.
   if (!existsSync(policyFile)) writeFileSync(policyFile, JSON.stringify(DEFAULT_POLICY, null, 2) + '\n');
   let policyRaw: unknown = JSON.parse(readFileSync(policyFile, 'utf8'));
   let policy: Policy = parsePolicy(policyRaw);
 
+  const chosen = o.embedding ? { provider: o.embedding } : await chooseEmbedding(env, o.fetch);
+  const embedding = chosen.provider;
+  if (!embedding.dim) await embedding.init();
   const store = o.store ?? new MemoryStore();
-  await store.init();
+  const { reembed } = await store.init(embedding.dim);
+
+  // Ids carry the boot id so that records from before a restart are never overwritten.
+  const tracker = new CallTracker(bus, undefined, `call_${boot}_`, rec => persist(() => store.putCall({ id: rec.id, at: rec.at, doc: structuredClone(rec) })));
+  const approvals = new ApprovalQueue(bus, o.approvalTimeoutMs, undefined, `apr_${boot}_`, row => persist(() => store.putApproval(row)));
+  // A call that was paused when the previous process stopped cannot be resumed: it was never executed.
+  const expired = await store.expirePendingApprovals('the server restarted before this was answered; the paused call was not executed', Date.now());
 
   // ---- audit: one hash chain for the whole server. A file that no longer verifies is set aside, never extended.
   let quarantined: { file: string; brokenAt: number; reason: string } | undefined;
@@ -151,14 +178,46 @@ export async function buildApp(o: AppOptions): Promise<App> {
   if (quarantined) audit.append('audit.quarantined', quarantined);
 
   // ---- fusion: one workspace ledger for everything ingested, always untrusted and graded.
+  if (expired) audit.append('approvals.expired', { count: expired, why: 'server restart' });
   const fusionLedger = new ProvenanceLedger();
-  const geoip = GeoIpTable.fromFile(env.GEOIP_CSV);
-  const embed = o.embed ?? hashEmbedding;
-  const fusion = new FusionService({ store, bus, ledger: fusionLedger, geoip, embed });
+  const ips = await IpResolver.open(env);
+  const places = new PlaceResolver({ fallback: SAMPLE_GAZETTEER, cache: store, ...(env.NOMINATIM_URL ? { nominatimUrl: env.NOMINATIM_URL } : {}), ...(o.fetch ? { fetch: o.fetch } : {}), ...(env.NOMINATIM_MIN_INTERVAL_MS ? { minIntervalMs: Number(env.NOMINATIM_MIN_INTERVAL_MS) } : {}) });
+  if (env.GEONAMES_TSV_PATH) await places.loadGeoNames(env.GEONAMES_TSV_PATH, env.GEONAMES_MIN_POPULATION ? Number(env.GEONAMES_MIN_POPULATION) : undefined);
+  const num = (v: string | undefined): number | undefined => (v !== undefined && v !== '' && Number.isFinite(Number(v)) ? Number(v) : undefined);
+  const ringHours = num(env.RING_WINDOW_HOURS);
+  const ringKm = num(env.RING_PROXIMITY_KM);
+  const ringMin = num(env.RING_PROXIMITY_WINDOW_MIN);
+  const fusion = new FusionService({
+    store, bus, ledger: fusionLedger, embedding, ips, places,
+    ...(ringHours ? { ringWindowMs: ringHours * 3_600_000 } : {}),
+    ...(ringKm ? { ringProximityKm: ringKm } : {}),
+    ...(ringMin ? { ringProximityWindowMs: ringMin * 60_000 } : {}),
+  });
   const onJobError = (name: string, e: Error) => bus.emit('fusion.job_failed', { queue: name, error: e.message.slice(0, 300) });
   const queue: JobQueue = o.redisUrl ? new BullQueue(o.redisUrl, fusion.handlers, o.queuePrefix, onJobError) : new InlineQueue(fusion.handlers, onJobError);
   fusion.attach(queue);
   await fusion.rebuildLedger();
+  if (reembed) await fusion.reembedAll();
+
+  // ---- live Telegram: polled through the gate proxy, ingested as untrusted provenance.
+  const tgChannels = parseTelegramChannels(env.TELEGRAM_CHANNELS);
+  const tgErrors: { at: number; channel: string; error: string }[] = [];
+  const telegram = tgChannels.length
+    ? new TelegramStreamer({
+        channels: tgChannels,
+        audit,
+        ingest: items => fusion.ingest(items.map((x, i) => parseRawItem(x, `telegram[${i}]`))),
+        cursor: { get: k => store.getKv(k), put: (k, v) => store.putKv(k, v) },
+        ...(num(env.TELEGRAM_POLL_SECONDS) ? { intervalMs: num(env.TELEGRAM_POLL_SECONDS)! * 1000 } : {}),
+        ...(o.telegram?.command ? { command: o.telegram.command } : {}),
+        ...(o.telegram?.env ? { env: o.telegram.env } : {}),
+        onError: (channel, error) => {
+          tgErrors.push({ at: Date.now(), channel, error: error.slice(0, 300) });
+          if (tgErrors.length > 20) tgErrors.shift();
+          bus.emit('telegram.error', { channel, error: error.slice(0, 300) });
+        },
+      })
+    : undefined;
 
   const fastify = Fastify({ logger: o.logger ?? false });
   await fastify.register(cors, { origin: [...origins], methods: ['GET', 'POST', 'PUT'] });
@@ -168,8 +227,28 @@ export async function buildApp(o: AppOptions): Promise<App> {
     if (req.method !== 'GET' && req.method !== 'OPTIONS' && origin && !origins.includes(origin))
       return reply.code(403).send({ error: `origin ${origin} is not allowed to change state` });
   });
+  // Every /api route and the event stream need the key, when one is set. Two exceptions: the health probe, and the
+  // ledger webhook, which authenticates each request with its own HMAC signature.
+  const keyBytes = apiKey ? Buffer.from(apiKey) : undefined;
+  const keyOk = (given: string | undefined): boolean => {
+    if (!keyBytes || !given) return false;
+    const g = Buffer.from(given);
+    return g.length === keyBytes.length && timingSafeEqual(g, keyBytes);
+  };
+  fastify.addHook('onRequest', async (req, reply) => {
+    if (!keyBytes || req.method === 'OPTIONS') return;
+    const path = req.url.split('?')[0]!;
+    if (!(path.startsWith('/api/') || path === '/events') || path === '/api/health' || path === '/api/ingest/ledger') return;
+    const auth = req.headers.authorization;
+    const bearer = typeof auth === 'string' && /^Bearer /i.test(auth) ? auth.slice(7).trim() : undefined;
+    const header = req.headers['x-api-key'];
+    if (!keyOk(bearer) && !keyOk(typeof header === 'string' ? header : undefined))
+      return reply.code(401).header('www-authenticate', 'Bearer').send({ error: 'missing or wrong API key: send "Authorization: Bearer <ADMIRALTY_API_KEY>" or "x-api-key"' });
+  });
   fastify.addHook('onClose', async () => {
     approvals.denyAll();
+    telegram?.stop();
+    await storeWrites;
     if (watching) unwatchFile(policyFile);
     await queue.close();
     await mirrorWrites;
@@ -183,7 +262,7 @@ export async function buildApp(o: AppOptions): Promise<App> {
     openaiModel: env.OPENAI_MODEL || 'gpt-4o',
   });
 
-  fastify.get('/api/health', async () => ({ ok: true, providers: providers(), pendingApprovals: approvals.list().length }));
+  fastify.get('/api/health', async () => ({ ok: true, authRequired: Boolean(apiKey), providers: providers(), pendingApprovals: approvals.list().length }));
 
   // ---- live events (SSE). Reconnects resume from Last-Event-ID; first connects get the backlog.
   fastify.get('/events', (req, reply) => {
@@ -214,6 +293,17 @@ export async function buildApp(o: AppOptions): Promise<App> {
 
   // ---- approvals
   fastify.get('/api/approvals', async () => ({ pending: approvals.list() }));
+  // Persisted records: what was asked, what was answered, and what expired with a restart.
+  fastify.get('/api/approvals/history', async req => {
+    await storeWrites;
+    const limit = Math.min(1000, Math.max(1, Number((req.query as { limit?: string }).limit ?? 200) || 200));
+    return { approvals: await store.listApprovals({ limit }) };
+  });
+  fastify.get('/api/calls', async req => {
+    await storeWrites;
+    const limit = Math.min(1000, Math.max(1, Number((req.query as { limit?: string }).limit ?? 200) || 200));
+    return { calls: (await store.listCalls(limit)).map(r => r.doc), store: store.kind };
+  });
   fastify.post('/api/approvals/:id', async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = req.body;
@@ -338,13 +428,33 @@ export async function buildApp(o: AppOptions): Promise<App> {
       const span = ledger.addUntrusted(s.text, { id, kind, ...(grade ? { grade } : {}), ...(typeof s.owner === 'string' && s.owner ? { owner: s.owner } : {}) });
       sources.push({ spanId: span.id, id, kind, trusted: false, text: s.text, ...(grade ? { grade: s.grade as string } : {}) });
     }
-    // "useLedger": also check the report against everything ingested into the fusion workspace.
-    if (b.useLedger === true)
-      for (const s of fusionLedger.spans()) {
-        const span = ledger.addUntrusted(s.text, s.origin);
-        sources.push({ spanId: span.id, id: s.origin.id, kind: s.origin.kind, trusted: false, text: s.text, ...(s.origin.grade ? { grade: `${s.origin.grade.r}${s.origin.grade.c}` } : {}) });
-      }
-    const gs = groundReport(b.report, ledger);
+    const sents = splitSentences(b.report);
+    const sentVecs = sents.length ? await embedding.embed(sents, 'query') : [];
+    // "useLedger": also check the report against the fusion workspace. Rather than every stored item, the candidates
+    // are each sentence's nearest stored items by embedding (a vector index query in PostgreSQL).
+    if (b.useLedger === true) {
+      const seen = new Set<string>();
+      for (const v of sentVecs)
+        for (const it of await store.queryItems({ near: v, limit: 20 })) {
+          if (seen.has(it.id)) continue;
+          seen.add(it.id);
+          const g = parseGrade(it.grade);
+          const span = ledger.addUntrusted(it.text, { id: it.sourceId, kind: it.sourceType, grade: g, ...(it.owner ? { owner: it.owner } : {}) });
+          sources.push({ spanId: span.id, id: it.sourceId, kind: it.sourceType, trusted: false, text: it.text, grade: it.grade });
+        }
+    }
+    // Semantic matches are computed here and handed to the core as plain scores. Only a provider that models
+    // meaning is used for this; the lexical mock would merely repeat what the wording check already does.
+    let semanticMatches: { matches: Record<number, { spanId: string; score: number }[]> } | undefined;
+    if (embedding.semantic && sents.length && sources.length) {
+      const srcVecs = await embedding.embed(sources.map(x => x.text), 'passage');
+      const dot = (x: number[], y: number[]) => x.reduce((acc, v, i) => acc + v * (y[i] ?? 0), 0);
+      semanticMatches = { matches: {} };
+      sentVecs.forEach((v, i) => {
+        semanticMatches!.matches[i] = srcVecs.map((sv, j) => ({ spanId: sources[j]!.spanId, score: dot(v, sv) })).sort((x, y) => y.score - x.score).slice(0, 3);
+      });
+    }
+    const gs = groundReport(b.report, ledger, semanticMatches ? { semanticMatches } : {});
     return {
       sentences: gs.map(g => ({
         ...g,
@@ -542,7 +652,11 @@ export async function buildApp(o: AppOptions): Promise<App> {
     return { approved, callId: rec.id };
   });
 
-  registerFusionRoutes(fastify, { fusion, store, audit, geoip, env, collectorsFile: join(o.dataDir, 'collectors.json'), embed, queueKind: queue.kind });
+  registerFusionRoutes(fastify, { fusion, store, audit, ips, places, embedding, ...(chosen.degraded ? { embeddingDegraded: chosen.degraded } : {}), env, collectorsFile: join(o.dataDir, 'collectors.json'), queueKind: queue.kind });
 
-  return { fastify, bus, approvals, fusion, store, queue, reloadPolicy, runFinished: id => done.get(id) ?? Promise.reject(new Error('no such run')) };
+  fastify.get('/api/telegram/status', async () => ({ configured: Boolean(telegram), channels: tgChannels, recentErrors: tgErrors }));
+  fastify.post('/api/telegram/poll', async (_req, reply) => (telegram ? { ingested: await telegram.pollOnce() } : reply.code(404).send({ error: 'TELEGRAM_CHANNELS is not set' })));
+  if (telegram && o.telegram?.autoStart !== false) telegram.start();
+
+  return { fastify, bus, approvals, fusion, store, queue, ...(telegram ? { telegram } : {}), reloadPolicy, runFinished: id => done.get(id) ?? Promise.reject(new Error('no such run')) };
 }

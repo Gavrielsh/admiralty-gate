@@ -18,6 +18,7 @@ if (!command) {
 const policyFile = flag('policy');
 runBridge({
   dashboard: flag('dashboard') ?? 'http://127.0.0.1:4319', command, args,
+  ...(process.env.ADMIRALTY_API_KEY ? { apiKey: process.env.ADMIRALTY_API_KEY } : {}),
   ...(policyFile ? { policyJson: readFileSync(policyFile, 'utf8') } : {}),
 }).then(
   code => process.exit(code),

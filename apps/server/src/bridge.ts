@@ -10,6 +10,8 @@ export interface BridgeOptions {
   dashboard: string;
   command: string;
   args: readonly string[];
+  /** ADMIRALTY_API_KEY of the dashboard, when it requires one. */
+  apiKey?: string;
   /** Policy JSON text; when omitted the dashboard's current policy is fetched. */
   policyJson?: string;
   stdin?: Readable;
@@ -22,11 +24,12 @@ export async function runBridge(o: BridgeOptions): Promise<number> {
   const f = o.fetch ?? fetch;
   const base = o.dashboard.replace(/\/$/, '');
   const log = o.log ?? (s => process.stderr.write(`[admiralty-gate bridge] ${s}\n`));
-  const policy = parsePolicy(o.policyJson ?? ((await (await f(`${base}/api/policy`)).json()) as { policy: unknown }).policy);
+  const auth: Record<string, string> = o.apiKey ? { authorization: `Bearer ${o.apiKey}` } : {};
+  const policy = parsePolicy(o.policyJson ?? ((await (await f(`${base}/api/policy`, { headers: auth })).json()) as { policy: unknown }).policy);
   const server = o.command.split(/[\\/]/).pop() ?? 'mcp-server';
   const report = async (decision: Decision, call: ToolCall): Promise<boolean> => {
     try {
-      const res = await f(`${base}/api/mcp/calls`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ server, call, decision }) });
+      const res = await f(`${base}/api/mcp/calls`, { method: 'POST', headers: { 'content-type': 'application/json', ...auth }, body: JSON.stringify({ server, call, decision }) });
       return res.ok && ((await res.json()) as { approved?: unknown }).approved === true;
     } catch (e) {
       log(`dashboard unreachable (${(e as Error).message}); treating as not approved`);

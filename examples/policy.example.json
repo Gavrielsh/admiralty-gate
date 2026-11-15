@@ -1,0 +1,16 @@
+{
+  "$comment": "Example policy for `admiralty-gate mcp-proxy`. Written and reviewed by the operator; the model never sees or edits it.",
+  "authorisedTargets": ["lab.example.org"],
+  "trusted": ["Standing task: monitor example.org and its subdomains"],
+  "tools": {
+    "search_news": { "tier": "view" },
+    "whois": { "tier": "lookup-infra", "targetArgs": ["domain"] },
+    "dns_lookup": { "tier": "lookup-infra", "targetArgs": ["domain"] },
+    "find_username": { "tier": "lookup-person", "targetArgs": "*" },
+    "port_scan": { "tier": "active-probe", "targetArgs": ["host"] },
+    "send_alert": { "tier": "publish", "targetArgs": "*" }
+  },
+  "defaultTool": { "tier": "lookup-person", "targetArgs": "*" },
+  "onTaintedSensitive": "require_approval",
+  "onUnknownInfra": "require_approval"
+}

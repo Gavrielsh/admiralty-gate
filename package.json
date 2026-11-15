@@ -1,14 +1,53 @@
 {
   "name": "admiralty-gate",
-  "version": "0.1.0",
-  "description": "Source-graded information-flow control for OSINT LLM agents: provenance, independence-aware corroboration, deterministic policy gates, ACH and calibration.",
+  "version": "0.2.0",
+  "description": "Source-graded information-flow control for LLM agents that read untrusted text and hold tools: provenance, a deterministic policy gate, an MCP proxy, report grounding, independence-aware corroboration, ACH and calibration.",
+  "keywords": [
+    "prompt-injection",
+    "llm",
+    "agents",
+    "mcp",
+    "osint",
+    "provenance",
+    "information-flow-control",
+    "admiralty",
+    "ach",
+    "calibration"
+  ],
   "type": "module",
   "license": "MIT",
-  "main": "src/index.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gavrielsh/admiralty-gate.git"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "admiralty-gate": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "examples/policy.example.json",
+    "README.md",
+    "RESULTS.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "redteam": "tsx examples/redteam-report.ts"
+    "redteam": "tsx examples/redteam-report.ts",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

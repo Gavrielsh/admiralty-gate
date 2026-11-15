@@ -8,3 +8,8 @@ export * from './ach.js';
 export * from './calibration.js';
 export * from './audit.js';
 export * from './adapters/osiris.js';
+export * from './session.js';
+export * from './policy.js';
+export * from './ground.js';
+export * from './mcp/proxy.js';
+export * from './mcp/stdio.js';

@@ -32,8 +32,12 @@ export type Tier =
 
 export interface ToolSpec {
   tier: Tier;
-  /** Argument names whose values are "targets" and therefore traced. Others are ignored. */
-  targetArgs: readonly string[];
+  /**
+   * Argument names whose values are "targets" and therefore traced. Others are ignored.
+   * Use '*' to trace every argument: the safe choice when you do not control which argument the tool reads its
+   * target from (third-party MCP servers, tools with aliases).
+   */
+  targetArgs: readonly string[] | '*';
 }
 
 export interface ToolCall {
@@ -61,8 +65,14 @@ export interface GateConfig {
   authorisedTargets?: readonly string[];
   /** Verdict for a sensitive tier when an argument's origin is "unknown". Default: require_approval. */
   onUnknown?: Verdict;
-  /** Verdict when an argument comes only from untrusted text. Default: deny for person/probe, approval for infra. */
+  /** Verdict when an infra-lookup argument comes only from untrusted text. Default: require_approval. */
   onTaintedInfra?: Verdict;
+  /**
+   * Verdict when a person-lookup / active-probe / publish argument comes only from untrusted text. Default: deny.
+   * Set "require_approval" only where a human really sees the request (e.g. the MCP proxy with elicitation), so an
+   * analyst can say "yes, look up the handle from that post".
+   */
+  onTaintedSensitive?: Verdict;
   /**
    * Verdict for an untraceable argument on a passive infra lookup. Default "allow" (passive public-data lookups are
    * low-harm and models legitimately derive hostnames); set "require_approval" for strict mode.
@@ -70,6 +80,8 @@ export interface GateConfig {
   onUnknownInfra?: Verdict;
   /** Unregistered tools: default deny. */
   allowUnregistered?: boolean;
+  /** Spec applied to tools not listed in `tools` (e.g. `{ tier: 'lookup-person', targetArgs: '*' }` to fail closed but usable). */
+  defaultTool?: ToolSpec;
 }
 
 const ORDER: Verdict[] = ['allow', 'require_approval', 'deny'];
@@ -83,8 +95,34 @@ function hostOf(v: string): string {
   }
 }
 
-function matchesAuthorised(target: string, authorised: readonly string[]): boolean {
+const HOSTNAME = /^(?:[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)(?:\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*\.?$/;
+const IPV6 = /^\[[0-9a-f:.]+\]$/;
+
+/**
+ * Is this value exactly ONE host (name, IP or URL)? Scanners commonly accept "a,b" or "a b" as several targets, so a
+ * value like "evil.example lab.example" must never be judged by its suffix alone.
+ */
+export function isSingleHost(target: string): boolean {
+  if (/[\s,;|<>"'`\\]/.test(target.trim()) || !target.trim()) return false;
   const h = hostOf(target);
+  return HOSTNAME.test(h) || IPV6.test(h);
+}
+
+/** Scalar leaves of an argument value: arrays and objects are walked, so a list of targets is checked item by item. */
+export function scalarLeaves(v: unknown, depth = 0): (string | number)[] {
+  if (typeof v === 'string') return v ? [v] : [];
+  if (typeof v === 'number') return [v];
+  if (v === null || typeof v !== 'object' || depth > 6) return [];
+  const out: (string | number)[] = [];
+  for (const x of Array.isArray(v) ? v : Object.values(v as Record<string, unknown>)) out.push(...scalarLeaves(x, depth + 1));
+  return out;
+}
+
+const RANK: Record<Trace['class'], number> = { trusted: 0, tainted: 1, unknown: 2 };
+
+function matchesAuthorised(target: string, authorised: readonly string[]): boolean {
+  if (!isSingleHost(target)) return false;
+  const h = hostOf(target).replace(/\.$/, '');
   return authorised.some(a => {
     const x = a.toLowerCase();
     return h === x || h.endsWith(`.${x}`);
@@ -103,7 +141,8 @@ export class Gate {
   }
 
   decide(call: ToolCall): Decision {
-    const entry = this.cfg.tools[call.tool];
+    // Own-property lookup only: a tool named "constructor" or "toString" must not resolve to Object.prototype.
+    const entry = Object.hasOwn(this.cfg.tools, call.tool) ? this.cfg.tools[call.tool] : this.cfg.defaultTool;
     const spec = typeof entry === 'function' ? entry(call) : entry;
     const traces: Record<string, Trace['class']> = {};
     const reasons: string[] = [];
@@ -125,26 +164,40 @@ export class Gate {
       return d;
     }
 
-    for (const name of spec.targetArgs) {
-      const raw = call.args[name];
-      if (raw === undefined || raw === null || raw === '') continue;
-      const t = this.ledger.trace(raw);
-      traces[name] = t.class;
+    const sensitive = spec.tier !== 'lookup-infra';
+    const onTaintedSensitive = this.cfg.onTaintedSensitive ?? 'deny';
+    const names = spec.targetArgs === '*' ? Object.keys(call.args) : spec.targetArgs;
+    let targets = 0;
 
-      if (t.class === 'trusted') continue;
+    for (const name of names) {
+      for (const leaf of scalarLeaves(call.args[name])) {
+        targets++;
+        const t = this.ledger.trace(leaf);
+        // Report the least-trusted class seen for this argument.
+        if (traces[name] === undefined || RANK[t.class] > RANK[traces[name]!]) traces[name] = t.class;
 
-      const via = t.origins.map(o => `${o.kind}:${o.id}`).join(', ');
-      if (t.class === 'tainted') {
-        if (spec.tier === 'lookup-infra') {
-          verdict = worst(verdict, onTaintedInfra);
-          reasons.push(`"${name}" appears only in untrusted text (${via}); infra lookups on feed-supplied targets need approval`);
-        } else {
-          verdict = worst(verdict, 'deny');
-          reasons.push(`"${name}" appears only in untrusted text (${via}); untrusted data cannot authorise a ${spec.tier} action`);
+        if (spec.tier === 'active-probe' && !matchesAuthorised(String(leaf), this.cfg.authorisedTargets ?? [])) {
+          verdict = 'deny';
+          reasons.push(
+            isSingleHost(String(leaf))
+              ? `"${name}" is not in the operator's authorised-target list; active probing is limited to systems the operator owns or is authorised to test`
+              : `"${name}" is not a single host; a probe target must be exactly one hostname, IP or URL`,
+          );
         }
-      } else {
-        // unknown: the model produced a value no recorded span contains.
-        if (spec.tier === 'lookup-infra') {
+
+        if (t.class === 'trusted') continue;
+
+        const via = t.origins.map(o => `${o.kind}:${o.id}`).join(', ');
+        if (t.class === 'tainted') {
+          if (!sensitive) {
+            verdict = worst(verdict, onTaintedInfra);
+            reasons.push(`"${name}" appears only in untrusted text (${via}); infra lookups on feed-supplied targets need approval`);
+          } else {
+            verdict = worst(verdict, onTaintedSensitive);
+            reasons.push(`"${name}" appears only in untrusted text (${via}); untrusted data cannot authorise a ${spec.tier} action`);
+          }
+        } else if (!sensitive) {
+          // unknown: the model produced a value no recorded span contains.
           const v = this.cfg.onUnknownInfra ?? 'allow';
           verdict = worst(verdict, v);
           if (v !== 'allow') reasons.push(`"${name}" cannot be traced to the operator or to any recorded source; strict infra mode`);
@@ -155,15 +208,11 @@ export class Gate {
       }
     }
 
-    if (spec.tier === 'active-probe') {
-      for (const name of spec.targetArgs) {
-        const raw = call.args[name];
-        if (typeof raw !== 'string' || !raw) continue;
-        if (!matchesAuthorised(raw, this.cfg.authorisedTargets ?? [])) {
-          verdict = 'deny';
-          reasons.push(`"${name}" is not in the operator's authorised-target list; active probing is limited to systems the operator owns or is authorised to test`);
-        }
-      }
+    // A person lookup or probe with no recognisable target must not pass as "everything traced": the tool may be
+    // reading its target from an argument the gate was not told about.
+    if (targets === 0 && (spec.tier === 'lookup-person' || spec.tier === 'active-probe')) {
+      verdict = worst(verdict, onUnknown);
+      reasons.push(`no target argument found for a ${spec.tier} call; nothing to trace, so it cannot be authorised automatically`);
     }
 
     if (spec.tier === 'publish') {
@@ -172,7 +221,7 @@ export class Gate {
       reasons.push('publish tier always needs an explicit release decision');
     }
 
-    if (reasons.length === 0) reasons.push('all target arguments trace to the operator');
+    if (reasons.length === 0) reasons.push(targets ? 'all target arguments trace to the operator' : 'no target arguments');
     const d: Decision = { verdict, tool: call.tool, tier: spec.tier, reasons, traces };
     this.audit.append('decision', d);
     return d;

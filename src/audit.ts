@@ -4,6 +4,7 @@
  * point on. Records are plain JSON, safe to ship to append-only storage.
  */
 import { createHash } from 'node:crypto';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 
 export interface AuditRecord {
   seq: number;
@@ -33,12 +34,41 @@ export function hashRecord(r: Omit<AuditRecord, 'hash'>): string {
 export class AuditLog {
   private readonly _records: AuditRecord[] = [];
 
-  constructor(private readonly clock: () => number = () => Date.now()) {}
+  /**
+   * @param sink called with every appended record, e.g. to write it to append-only storage as it happens.
+   * @param resumeFrom records of an earlier run to continue the chain from (they are verified first).
+   */
+  constructor(
+    private readonly clock: () => number = () => Date.now(),
+    private readonly sink?: (rec: AuditRecord) => void,
+    resumeFrom: readonly AuditRecord[] = [],
+  ) {
+    if (resumeFrom.length) {
+      const v = AuditLog.verify(resumeFrom);
+      if (!v.ok) throw new Error(`Refusing to extend a broken audit chain: ${v.reason} at record ${v.at}`);
+      this._records.push(...resumeFrom);
+    }
+  }
+
+  /**
+   * A log persisted to a JSONL file: existing records are verified and the chain continues after them; each new
+   * record is appended synchronously, so a crash loses at most the record being written.
+   */
+  static file(path: string, clock: () => number = () => Date.now()): AuditLog {
+    const prior = existsSync(path) ? AuditLog.fromJsonl(readFileSync(path, 'utf8')) : [];
+    return new AuditLog(clock, rec => appendFileSync(path, JSON.stringify(rec) + '\n'), prior);
+  }
+
+  /** Hash of the newest record. Publishing or countersigning it elsewhere makes truncation of the tail detectable. */
+  head(): string {
+    return this._records.length ? this._records[this._records.length - 1]!.hash : GENESIS;
+  }
 
   append(kind: string, data: unknown): AuditRecord {
     const prev = this._records.length ? this._records[this._records.length - 1]!.hash : GENESIS;
     const base = { seq: this._records.length, at: this.clock(), kind, data: JSON.parse(stable(data)) as unknown, prev };
     const rec: AuditRecord = { ...base, hash: hashRecord(base) };
+    this.sink?.(rec);
     this._records.push(rec);
     return rec;
   }

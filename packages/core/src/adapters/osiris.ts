@@ -9,7 +9,9 @@
  * wrap `deps.exec` with `gateOsirisExec`.
  */
 import { AuditLog } from '../audit.js';
-import { Gate, type Decision, type GateConfig, type ToolCall, type ToolSpec } from '../guard.js';
+import { extractCoordinates } from '../geo.js';
+import type { Grade } from '../grades.js';
+import { Gate, isSingleHost, scalarLeaves, type Decision, type GateConfig, type ToolCall, type ToolSpec } from '../guard.js';
 import type { ProvenanceLedger } from '../provenance.js';
 
 /** Mirror of the alias table in OSIRIS src/lib/oi/assist/recon.ts, so aliases cannot dodge the tiering. */
@@ -48,6 +50,30 @@ function reconSpec(call: ToolCall): ToolSpec {
   return { tier: 'active-probe', targetArgs: TARGET_ARGS };
 }
 
+/**
+ * `geo-enrich` on a host, IP or coordinate pair is a passive infrastructure lookup. On anything else (a handle, a
+ * phone number, a name) it is locating a person, and is tiered accordingly. No target at all: fail closed.
+ */
+function geoEnrichSpec(call: ToolCall): ToolSpec {
+  const leaves = Object.values(call.args).flatMap(v => scalarLeaves(v)).map(String);
+  // A bare word ("carol_k_1988") is a valid single-label hostname, so "is a host" must mean an IP or a dotted name.
+  const hostLike = (v: string): boolean => isSingleHost(v) && /[.:]/.test(v);
+  const infra = leaves.length > 0 && leaves.every(v => hostLike(v) || extractCoordinates(v).length > 0 || /^-?\d+(\.\d+)?$/.test(v));
+  return { tier: infra ? 'lookup-infra' : 'lookup-person', targetArgs: '*' };
+}
+
+/** Collection and fusion tools. Hyphen and underscore spellings are both registered so neither dodges the tiering. */
+function fusionTools(): GateConfig['tools'] {
+  const fetch: ToolSpec = { tier: 'lookup-infra', targetArgs: ['url', 'source', 'channel', 'feed', 'query', 'target'] };
+  // An entity graph around a target is a profile of whoever the target is: person tier, every argument traced.
+  const graph: ToolSpec = { tier: 'lookup-person', targetArgs: '*' };
+  return {
+    'osint-fetch': fetch, osint_fetch: fetch,
+    'geo-enrich': geoEnrichSpec, geo_enrich: geoEnrichSpec,
+    'entity-graph': graph, entity_graph: graph,
+  };
+}
+
 export function osirisGateConfig(opts: { authorisedTargets?: readonly string[] } = {}): GateConfig {
   const view: ToolSpec = { tier: 'view', targetArgs: [] };
   return {
@@ -58,6 +84,7 @@ export function osirisGateConfig(opts: { authorisedTargets?: readonly string[] }
       // A forecast question spends model and search budget; one lifted verbatim from a feed needs a human.
       forecast: { tier: 'lookup-infra', targetArgs: ['question'] },
       recon: reconSpec,
+      ...fusionTools(),
     },
   };
 }
@@ -70,7 +97,15 @@ export interface GateHooks {
   /** Consulted for require_approval. Default: not approved. */
   approve?: (d: Decision) => Promise<boolean>;
   onDecision?: (d: Decision, call: ToolCall) => void;
+  /**
+   * Admiralty grade recorded on each tool's output, by tool name. A tool with no entry is recorded as F6 ("cannot be
+   * judged"), which carries no evidential weight until someone grades the source.
+   */
+  grades?: Readonly<Record<string, Grade>>;
 }
+
+/** Grade given to tool output nobody has graded. */
+export const UNGRADED: Grade = { r: 'F', c: 6 };
 
 /**
  * Wrap an OSIRIS `exec(call, signal)`. Tool results (which carry feed text) are
@@ -105,7 +140,8 @@ export function gateOsirisExec<O extends OutcomeLike, C extends ToolCall>(
         };
       }
       const out = await exec(call, signal);
-      ledger.addUntrusted(`${out.result.summary}\n${safeJson(out.result.data)}`, { id: call.tool, kind: 'tool' });
+      const grade = (hooks.grades && Object.hasOwn(hooks.grades, call.tool) ? hooks.grades[call.tool] : undefined) ?? UNGRADED;
+      ledger.addUntrusted(`${out.result.summary}\n${safeJson(out.result.data)}`, { id: call.tool, kind: 'tool', grade });
       return out;
     },
   };

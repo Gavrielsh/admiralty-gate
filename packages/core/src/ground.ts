@@ -14,6 +14,8 @@
  * reuses a source's words to say the opposite still scores high. It shows
  * lineage, not truth. Use it to direct human attention, not to replace it.
  */
+import { extractEntities, indicatorKey, type Indicator } from './entities.js';
+import { extractCoordinates, haversineKm, type GeoPoint } from './geo.js';
 import { gradeString, weightOf, type Grade } from './grades.js';
 import { clusterItems, type ClusterOptions } from './independence.js';
 import type { Origin, ProvenanceLedger, Span } from './provenance.js';
@@ -50,6 +52,17 @@ export interface GroundedSentence {
   unsupportedSpecifics: string[];
   /** Supporting span carried injection-style telemetry flags. */
   fromFlaggedSource: boolean;
+  /**
+   * Typed view of the hard identifiers in `unsupportedSpecifics`: IPs, wallets, transaction hashes, ASNs, phones,
+   * handles, domains and coordinate pairs that no recorded source contains. A coordinate pair is "found" when a
+   * source has a pair within `coordToleranceKm`, so honest rounding is not flagged.
+   */
+  unsupportedEntities: { kind: Indicator['kind'] | 'coordinates'; value: string }[];
+  /**
+   * Fabricated links: two identifiers that each appear in the sources, but never in the SAME source. "Wallet W was
+   * used from IP X" needs one source that has both; two sources that each have one do not establish it.
+   */
+  unsupportedLinks: { a: string; b: string }[];
 }
 
 export interface GroundOptions extends ClusterOptions {
@@ -59,6 +72,8 @@ export interface GroundOptions extends ClusterOptions {
   weak?: number;
   /** A span counts as support if its overlap is at least this share of the best overlap. Default 0.8. */
   supportBand?: number;
+  /** How far a coordinate pair in the report may be from one in a source and still count as that location. Default 1 km. */
+  coordToleranceKm?: number;
 }
 
 /** Sentence split over Latin, Hebrew, Arabic, Persian, Urdu, Devanagari and CJK terminators, and line breaks. */
@@ -83,6 +98,11 @@ export function groundReport(report: string, ledger: ProvenanceLedger, opts: Gro
   const sets = new Map<string, Set<string>>();
   const df = new Map<string, number>();
   const all = new Set<string>();
+  const coordTol = opts.coordToleranceKm ?? 1;
+  const spanEntities = spans.map(s => new Set(extractEntities(s.text).map(indicatorKey)));
+  const spanCoords = spans.map(s => extractCoordinates(s.text));
+  const coordKey = (p: GeoPoint): string => `${p.lat},${p.lon}`;
+  const hasCoord = (i: number, p: GeoPoint): boolean => spanCoords[i]!.some(q => haversineKm(p, q) <= coordTol);
   for (const s of spans) {
     const set = new Set<string>([...s.tokens, ...s.hosts]);
     sets.set(s.id, set);
@@ -122,14 +142,38 @@ export function groundReport(report: string, ledger: ProvenanceLedger, opts: Gro
       const g = x.span.origin.grade;
       if (g && (!bestGrade || weightOf(g) > weightOf(bestGrade))) bestGrade = g;
     }
+    // Hard identifiers and coordinates, checked as wholes rather than token by token.
+    const ents = extractEntities(text);
+    const coords = extractCoordinates(text);
+    const coordTokens = new Set(coords.flatMap(p => [String(Math.abs(p.lat)), String(Math.abs(p.lon)), String(p.lat), String(p.lon)]));
+    const unsupportedEntities: GroundedSentence['unsupportedEntities'] = [];
+    const present: { label: string; inSpan: (i: number) => boolean }[] = [];
+    for (const e of ents) {
+      const k = indicatorKey(e);
+      if (spanEntities.some(set => set.has(k))) present.push({ label: e.value, inSpan: i => spanEntities[i]!.has(k) });
+      else if (e.kind !== 'domain' || !all.has(e.value)) unsupportedEntities.push({ kind: e.kind, value: e.value });
+    }
+    for (const p of coords) {
+      if (spans.some((_, i) => hasCoord(i, p))) present.push({ label: coordKey(p), inSpan: i => hasCoord(i, p) });
+      else unsupportedEntities.push({ kind: 'coordinates', value: coordKey(p) });
+    }
+    const unsupportedLinks: GroundedSentence['unsupportedLinks'] = [];
+    for (let i = 0; i < present.length && unsupportedLinks.length < 20; i++)
+      for (let j = i + 1; j < present.length; j++)
+        if (!spans.some((_, k) => present[i]!.inSpan(k) && present[j]!.inSpan(k))) unsupportedLinks.push({ a: present[i]!.label, b: present[j]!.label });
+
+    const tokenSpecifics = toks.filter(t => isSpecific(t) && !all.has(t) && !coordTokens.has(t));
+    const seen = new Set(tokenSpecifics.map(t => t.toLowerCase()));
     const out: GroundedSentence = {
       text,
       status,
       overlap: best,
       support: supporting.map(x => ({ spanId: x.span.id, origin: x.span.origin, overlap: x.overlap })),
       independentOrigins: clusters.size,
-      unsupportedSpecifics: toks.filter(t => isSpecific(t) && !all.has(t)),
+      unsupportedSpecifics: [...tokenSpecifics, ...unsupportedEntities.map(e => e.value).filter(v => !seen.has(v.toLowerCase()))],
       fromFlaggedSource: untrusted.some(x => x.span.flags.length > 0),
+      unsupportedEntities,
+      unsupportedLinks,
     };
     if (bestGrade) out.bestGrade = gradeString(bestGrade);
     return out;
@@ -170,6 +214,7 @@ export function annotateReport(gs: readonly GroundedSentence[]): string {
         g.status === 'grounded' || g.status === 'weak' ? `${g.independentOrigins} independent` : '',
         g.bestGrade ? `best ${g.bestGrade}` : '',
         g.unsupportedSpecifics.length ? `NOT IN ANY SOURCE: ${g.unsupportedSpecifics.join(', ')}` : '',
+        g.unsupportedLinks.length ? `LINK IN NO SINGLE SOURCE: ${g.unsupportedLinks.map(l => `${l.a} <-> ${l.b}`).join('; ')}` : '',
         g.fromFlaggedSource ? 'source has injection-style flags' : '',
       ].filter(Boolean);
       return `[${bits.join(' | ')}] ${g.text}`;

@@ -12,7 +12,9 @@
  * probability until calibration.ts has been used to fit it to outcomes.
  */
 import { estimativePhrase, gradeString, weightOf, type Grade } from './grades.js';
-import { clusterItems, type ClusterOptions, type Item } from './independence.js';
+import type { Indicator } from './entities.js';
+import type { GeoFlag, GeoPoint } from './geo.js';
+import { clusterItems, type ClusterLink, type ClusterOptions, type Item } from './independence.js';
 import type { Origin } from './provenance.js';
 
 export type Stance = 'supports' | 'contradicts';
@@ -27,6 +29,11 @@ export interface Evidence {
   grade?: Grade;
   cites?: string[];
   at?: number;
+  /** See Item: who produced it, where it says it happened, where its IP says it came from. */
+  indicators?: readonly Indicator[];
+  geo?: GeoPoint;
+  claimedPlace?: string;
+  ipGeo?: GeoPoint;
 }
 
 export type AssessmentFlag =
@@ -34,7 +41,11 @@ export type AssessmentFlag =
   | 'echo-chamber'
   | 'contested'
   | 'ungraded-evidence'
-  | 'no-independent-support';
+  | 'no-independent-support'
+  /** Supporting items were merged because they share indicators, a time burst or a location. */
+  | 'coordinated'
+  /** A supporting item's coordinates contradict the place it names or its IP geolocation. */
+  | 'geo-mismatch';
 
 export interface ClusterSummary {
   id: string;
@@ -55,6 +66,12 @@ export interface Assessment {
   rawSupportItems: number;
   clusters: ClusterSummary[];
   flags: AssessmentFlag[];
+  /** Share of supporting items that turned out to be echoes: 1 - independentSupport / rawSupportItems. */
+  echoReduction: number;
+  /** Why items were merged into one origin. */
+  links: ClusterLink[];
+  /** Item id -> geospatial inconsistencies found on it. */
+  geoFlags: Record<string, GeoFlag[]>;
 }
 
 function gradeOf(e: Evidence): Grade | undefined {
@@ -73,8 +90,15 @@ export function corroborate(evidence: readonly Evidence[], opts: ClusterOptions 
   for (const [claim, list] of byClaim) {
     // Independence is judged across ALL evidence on the claim, regardless of stance: a source
     // that republishes both sides is still one source.
-    const items: Item[] = list.map(e => ({ id: e.id, text: e.text, origin: e.origin, cites: e.cites ?? [] }));
-    const { clusters } = clusterItems(items, opts);
+    const items: Item[] = list.map(e => ({
+      id: e.id, text: e.text, origin: e.origin, cites: e.cites ?? [],
+      ...(e.indicators ? { indicators: e.indicators } : {}),
+      ...(e.at !== undefined ? { at: e.at } : {}),
+      ...(e.geo ? { geo: e.geo } : {}),
+      ...(e.claimedPlace ? { claimedPlace: e.claimedPlace } : {}),
+      ...(e.ipGeo ? { ipGeo: e.ipGeo } : {}),
+    }));
+    const { clusters, links, geoFlags } = clusterItems(items, opts);
     const byId = new Map(list.map(e => [e.id, e]));
 
     const summaries: ClusterSummary[] = [];
@@ -124,6 +148,10 @@ export function corroborate(evidence: readonly Evidence[], opts: ClusterOptions 
     if (supportClusters.length === 1) flags.add('single-source');
     if (rawSupportItems >= 3 && supportClusters.length <= 1) flags.add('echo-chamber');
     if (support >= 0.4 && contradiction >= 0.4) flags.add('contested');
+    const supporting = new Set(list.filter(e => e.stance === 'supports').map(e => e.id));
+    if (links.some(l => (l.reason === 'shared-indicator' || l.reason === 'burst' || l.reason === 'proximity') && supporting.has(l.a) && supporting.has(l.b)))
+      flags.add('coordinated');
+    if ([...geoFlags.keys()].some(id => supporting.has(id))) flags.add('geo-mismatch');
 
     out.push({
       claim,
@@ -136,6 +164,9 @@ export function corroborate(evidence: readonly Evidence[], opts: ClusterOptions 
       rawSupportItems,
       clusters: summaries,
       flags: [...flags],
+      echoReduction: rawSupportItems ? 1 - supportClusters.length / rawSupportItems : 0,
+      links,
+      geoFlags: Object.fromEntries(geoFlags),
     });
   }
   return out.sort((a, b) => b.confidence - a.confidence);
@@ -148,6 +179,8 @@ export interface PublishRule {
   maxContradiction: number;
   /** Disallow release when the only support is an echo of a single origin. */
   blockEchoChamber: boolean;
+  /** Hold back a claim whose supporting evidence has coordinates that contradict its place or IP geolocation. */
+  blockGeoMismatch?: boolean;
 }
 
 export const DEFAULT_PUBLISH_RULE: PublishRule = {
@@ -155,6 +188,7 @@ export const DEFAULT_PUBLISH_RULE: PublishRule = {
   minConfidence: 0.8,
   maxContradiction: 0.3,
   blockEchoChamber: true,
+  blockGeoMismatch: true,
 };
 
 export interface ReleaseDecision {
@@ -173,5 +207,7 @@ export function canRelease(a: Assessment, rule: PublishRule = DEFAULT_PUBLISH_RU
     reasons.push(`contradiction ${a.contradiction.toFixed(2)} exceeds ${rule.maxContradiction}`);
   if (rule.blockEchoChamber && a.flags.includes('echo-chamber'))
     reasons.push('support is an echo of a single origin');
+  if (rule.blockGeoMismatch && a.flags.includes('geo-mismatch'))
+    reasons.push('supporting evidence has coordinates that contradict the place it names or its IP geolocation');
   return { allowed: reasons.length === 0, reasons };
 }

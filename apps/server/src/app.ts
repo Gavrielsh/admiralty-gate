@@ -6,7 +6,7 @@
  */
 import cors from '@fastify/cors';
 import Fastify, { type FastifyInstance } from 'fastify';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unwatchFile, watchFile, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   AuditLog, GuardedSession, McpGateProxy, ProvenanceLedger, groundReport, parseGrade, parsePolicy, summariseGrounding,
@@ -15,6 +15,13 @@ import {
 import { ApprovalQueue } from './approvals.js';
 import { EventBus, type GateEvent } from './bus.js';
 import { CallTracker, type CallRecord } from './calls.js';
+import { hashEmbedding } from './fusion/embed.js';
+import { GeoIpTable } from './fusion/geoip.js';
+import { BullQueue, InlineQueue, type JobQueue } from './fusion/queue.js';
+import { registerFusionRoutes } from './fusion/routes.js';
+import { FusionService } from './fusion/service.js';
+import { MemoryStore } from './fusion/store.js';
+import type { Store } from './fusion/types.js';
 import { newAnthropicClient, runAnthropicAgent, runOpenAiAgent, type AnthropicLike } from './sandbox/agents.js';
 import { SCENARIOS, type Scenario } from './sandbox/scenarios.js';
 import { DEFAULT_FEED, DEFAULT_POLICY, TOOL_DEFS, simulatedTool } from './sandbox/tools.js';
@@ -30,12 +37,27 @@ export interface AppOptions {
   fetch?: typeof fetch;
   anthropicClient?: (apiKey: string) => AnthropicLike;
   logger?: boolean;
+  /** Where provenance, incidents and the audit mirror live. Default: in memory. */
+  store?: Store;
+  /** Redis URL for BullMQ queues. Default: in-process queue. */
+  redisUrl?: string;
+  /** BullMQ key prefix (lets test runs share a Redis). */
+  queuePrefix?: string;
+  /** Text embedding of dimension 256. Default: lexical hashing (see fusion/embed.ts). */
+  embed?: (text: string) => number[];
+  /** How often policy.json is checked for edits made outside the API. Default 1000 ms; 0 disables. */
+  policyWatchMs?: number;
 }
 
 export interface App {
   fastify: FastifyInstance;
   bus: EventBus;
   approvals: ApprovalQueue;
+  fusion: FusionService;
+  store: Store;
+  queue: JobQueue;
+  /** Re-read policy.json now (the file watcher calls this). */
+  reloadPolicy: () => void;
   /** Resolves when a sandbox run has finished (tests). */
   runFinished: (runId: string) => Promise<RunInfo>;
 }
@@ -95,6 +117,9 @@ export async function buildApp(o: AppOptions): Promise<App> {
   let policyRaw: unknown = JSON.parse(readFileSync(policyFile, 'utf8'));
   let policy: Policy = parsePolicy(policyRaw);
 
+  const store = o.store ?? new MemoryStore();
+  await store.init();
+
   // ---- audit: one hash chain for the whole server. A file that no longer verifies is set aside, never extended.
   let quarantined: { file: string; brokenAt: number; reason: string } | undefined;
   if (existsSync(auditFile)) {
@@ -109,12 +134,31 @@ export async function buildApp(o: AppOptions): Promise<App> {
   const audit = new AuditLog(
     () => Date.now(),
     rec => {
+      // The file is the authority; the database row is a queryable copy and may lag by one write.
       appendFileSync(auditFile, JSON.stringify(rec) + '\n');
+      mirrorWrites = mirrorWrites.then(() => store.mirrorAudit({ seq: rec.seq, hash: rec.hash, prev: rec.prev, kind: rec.kind, at: rec.at, data: rec.data })).catch(() => undefined);
       bus.emit('audit.appended', { record: rec });
     },
     prior,
   );
+  let mirrorWrites: Promise<void> = Promise.resolve();
+  // Bring the mirror in line with the file: after a quarantine, a restore, or a first run against an existing log.
+  const m0 = await store.auditMirror();
+  if (m0.count !== prior.length || m0.head !== (prior[prior.length - 1]?.hash ?? null)) {
+    await store.truncateAuditMirror(0);
+    for (const r of prior) await store.mirrorAudit({ seq: r.seq, hash: r.hash, prev: r.prev, kind: r.kind, at: r.at, data: r.data });
+  }
   if (quarantined) audit.append('audit.quarantined', quarantined);
+
+  // ---- fusion: one workspace ledger for everything ingested, always untrusted and graded.
+  const fusionLedger = new ProvenanceLedger();
+  const geoip = GeoIpTable.fromFile(env.GEOIP_CSV);
+  const embed = o.embed ?? hashEmbedding;
+  const fusion = new FusionService({ store, bus, ledger: fusionLedger, geoip, embed });
+  const onJobError = (name: string, e: Error) => bus.emit('fusion.job_failed', { queue: name, error: e.message.slice(0, 300) });
+  const queue: JobQueue = o.redisUrl ? new BullQueue(o.redisUrl, fusion.handlers, o.queuePrefix, onJobError) : new InlineQueue(fusion.handlers, onJobError);
+  fusion.attach(queue);
+  await fusion.rebuildLedger();
 
   const fastify = Fastify({ logger: o.logger ?? false });
   await fastify.register(cors, { origin: [...origins], methods: ['GET', 'POST', 'PUT'] });
@@ -124,7 +168,13 @@ export async function buildApp(o: AppOptions): Promise<App> {
     if (req.method !== 'GET' && req.method !== 'OPTIONS' && origin && !origins.includes(origin))
       return reply.code(403).send({ error: `origin ${origin} is not allowed to change state` });
   });
-  fastify.addHook('onClose', async () => approvals.denyAll());
+  fastify.addHook('onClose', async () => {
+    approvals.denyAll();
+    if (watching) unwatchFile(policyFile);
+    await queue.close();
+    await mirrorWrites;
+    await store.close();
+  });
 
   const providers = () => ({
     anthropic: Boolean(env.ANTHROPIC_API_KEY),
@@ -199,9 +249,39 @@ export async function buildApp(o: AppOptions): Promise<App> {
     return { valid: true, policy: policyRaw };
   });
 
+  // Hot reload: an edit made to policy.json outside the API takes effect without a restart, if and only if it
+  // passes the strict validator. A bad edit is reported and the running policy stays as it was.
+  const reloadPolicy = () => {
+    let text: string;
+    try {
+      text = readFileSync(policyFile, 'utf8');
+    } catch {
+      return;
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+      if (JSON.stringify(raw) === JSON.stringify(policyRaw)) return;
+      policy = parsePolicy(raw);
+    } catch (e) {
+      bus.emit('policy.rejected', { error: (e as Error).message, source: 'file' });
+      return;
+    }
+    policyRaw = raw;
+    audit.append('policy.updated', { source: 'file', tools: Object.keys(policy.config.tools), authorisedTargets: policy.config.authorisedTargets ?? [] });
+    bus.emit('policy.updated', { policy: policyRaw, source: 'file' });
+  };
+  const watchMs = o.policyWatchMs ?? 1000;
+  const watching = watchMs > 0;
+  if (watching) watchFile(policyFile, { interval: watchMs }, reloadPolicy);
+
   // ---- audit
   const readAudit = () => verifyAuditFile(existsSync(auditFile) ? readFileSync(auditFile, 'utf8') : '');
-  fastify.get('/api/audit', async () => ({ ...readAudit(), file: auditFile, ...(quarantined ? { quarantined } : {}) }));
+  fastify.get('/api/audit', async () => {
+    await mirrorWrites;
+    const m = await store.auditMirror();
+    return { ...readAudit(), file: auditFile, mirror: { store: store.kind, count: m.count, head: m.head, inSync: m.count === audit.records().length && m.head === (audit.records().length ? audit.head() : null) }, ...(quarantined ? { quarantined } : {}) };
+  });
   /**
    * Demo only: edits one record IN THE FILE (never the in-memory chain) so the viewer can show detection.
    * `restore` rewrites the file from memory. Disable with ADMIRALTY_TAMPER_DEMO=0.
@@ -258,6 +338,12 @@ export async function buildApp(o: AppOptions): Promise<App> {
       const span = ledger.addUntrusted(s.text, { id, kind, ...(grade ? { grade } : {}), ...(typeof s.owner === 'string' && s.owner ? { owner: s.owner } : {}) });
       sources.push({ spanId: span.id, id, kind, trusted: false, text: s.text, ...(grade ? { grade: s.grade as string } : {}) });
     }
+    // "useLedger": also check the report against everything ingested into the fusion workspace.
+    if (b.useLedger === true)
+      for (const s of fusionLedger.spans()) {
+        const span = ledger.addUntrusted(s.text, s.origin);
+        sources.push({ spanId: span.id, id: s.origin.id, kind: s.origin.kind, trusted: false, text: s.text, ...(s.origin.grade ? { grade: `${s.origin.grade.r}${s.origin.grade.c}` } : {}) });
+      }
     const gs = groundReport(b.report, ledger);
     return {
       sentences: gs.map(g => ({
@@ -456,5 +542,7 @@ export async function buildApp(o: AppOptions): Promise<App> {
     return { approved, callId: rec.id };
   });
 
-  return { fastify, bus, approvals, runFinished: id => done.get(id) ?? Promise.reject(new Error('no such run')) };
+  registerFusionRoutes(fastify, { fusion, store, audit, geoip, env, collectorsFile: join(o.dataDir, 'collectors.json'), embed, queueKind: queue.kind });
+
+  return { fastify, bus, approvals, fusion, store, queue, reloadPolicy, runFinished: id => done.get(id) ?? Promise.reject(new Error('no such run')) };
 }

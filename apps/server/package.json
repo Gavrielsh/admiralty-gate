@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "main": "dist/main.js",
-  "bin": { "admiralty-gate-mcp-bridge": "dist/mcp-bridge.js" },
+  "bin": {
+    "admiralty-gate-mcp-bridge": "dist/mcp-bridge.js"
+  },
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "start": "node dist/main.js",
@@ -16,12 +18,15 @@
     "@anthropic-ai/sdk": "latest",
     "@fastify/cors": "latest",
     "admiralty-gate": "*",
-    "fastify": "^5.0.0"
+    "fastify": "^5.0.0",
+    "pg": "^8.13.0",
+    "bullmq": "^5.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
-    "vitest": "^2.1.0"
+    "vitest": "^2.1.0",
+    "@types/pg": "^8.11.0"
   }
 }

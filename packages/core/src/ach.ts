@@ -128,3 +128,33 @@ export async function fillCells(
   }
   return cells;
 }
+
+export interface AttributionRule {
+  /** Minimum gap in weighted inconsistency between the leader and the runner-up. Default 0.5. */
+  minMargin: number;
+  /** Minimum number of evidence rows that discriminate between hypotheses at all. Default 2. */
+  minDiagnostic: number;
+  /** A load-bearing (critical) item must weigh at least this much. Default 0.5 (roughly C2 or better). */
+  minCriticalWeight: number;
+}
+
+export const DEFAULT_ATTRIBUTION_RULE: AttributionRule = { minMargin: 0.5, minDiagnostic: 2, minCriticalWeight: 0.5 };
+
+/**
+ * May the leading hypothesis be stated as the attribution? Deterministic, like canRelease: the model has no vote.
+ * It is held back when the lead is thin, when too little evidence discriminates, or when the conclusion flips on
+ * the removal of a single weak or ungraded item.
+ */
+export function attributionGate(result: AchResult, rule: AttributionRule = DEFAULT_ATTRIBUTION_RULE): { allowed: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  if (result.ranking.length < 2) reasons.push('only one hypothesis was considered; an attribution needs competing explanations');
+  else if (result.margin < rule.minMargin)
+    reasons.push(`the lead over the next hypothesis is ${result.margin.toFixed(2)}, below ${rule.minMargin}`);
+  const diagnostic = result.diagnosticity.filter(d => d.diagnosticity > 0).length;
+  if (diagnostic < rule.minDiagnostic) reasons.push(`only ${diagnostic} evidence item(s) discriminate between the hypotheses; needs ${rule.minDiagnostic}`);
+  const weight = new Map(result.diagnosticity.map(d => [d.id, d.weight]));
+  for (const c of result.critical)
+    if ((weight.get(c.id) ?? 0) < rule.minCriticalWeight)
+      reasons.push(`the conclusion flips without "${c.label}", and that item is weak (weight ${(weight.get(c.id) ?? 0).toFixed(2)})`);
+  return { allowed: reasons.length === 0, reasons };
+}

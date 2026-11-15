@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_PUBLISH_RULE, ProvenanceLedger, SAMPLE_GAZETTEER, UNGRADED, canRelease, checkGeoConsistency, clusterItems,
   corroborate, extractCoordinates, extractEntities, findPlaces, gateOsirisExec, groundReport, haversineKm, indicatorKey,
-  normaliseIndicator, osirisGateConfig, annotateReport, Gate, type Evidence, type Item, type Origin,
+  normaliseIndicator, osirisGateConfig, ach, attributionGate, annotateReport, Gate, type Evidence, type Item, type Origin,
 } from '../src/index.js';
 
 const o = (id: string, kind: Origin['kind'] = 'telegram', grade?: Origin['grade']): Origin => ({ id, kind, ...(grade ? { grade } : {}) });
@@ -319,5 +319,29 @@ describe('OSIRIS adapter: fusion tools', () => {
     const blocked = await exec({ tool: 'entity-graph', args: { seed: 'dave_p_2001' } });
     expect(blocked.result.ok).toBe(false);
     expect(blocked.result.summary).toContain('Blocked by policy (deny)');
+  });
+});
+
+describe('attributionGate', () => {
+  const hyp = [{ id: 'h1', label: 'Group A' }, { id: 'h2', label: 'Group B' }];
+  const A2 = { r: 'A', c: 2 } as const;
+  const E4 = { r: 'E', c: 4 } as const;
+
+  it('allows an attribution with a clear lead resting on strong evidence', () => {
+    const r = ach({ hypotheses: hyp, evidence: [{ id: 'e1', label: 'malware reuse', grade: A2 }, { id: 'e2', label: 'infrastructure overlap', grade: A2 }, { id: 'e3', label: 'working hours', grade: A2 }],
+      cells: { e1: { h1: 2, h2: -2 }, e2: { h1: 1, h2: -1 }, e3: { h1: 1, h2: -1 } } });
+    expect(attributionGate(r)).toEqual({ allowed: true, reasons: [] });
+  });
+
+  it('blocks when the conclusion hinges on one weak item, when the lead is thin, or when there is no competing hypothesis', () => {
+    const weak = ach({ hypotheses: hyp, evidence: [{ id: 'e1', label: 'anonymous forum post', grade: E4 }, { id: 'e2', label: 'language artefact', grade: A2 }],
+      cells: { e1: { h1: 2, h2: -2 }, e2: { h1: 0, h2: 0 } } });
+    const g = attributionGate(weak);
+    expect(g.allowed).toBe(false);
+    expect(g.reasons.join(' | ')).toMatch(/lead over the next hypothesis/);
+    expect(g.reasons.join(' | ')).toMatch(/only 1 evidence item/);
+    expect(g.reasons.join(' | ')).toMatch(/flips without "anonymous forum post"/);
+    const solo = ach({ hypotheses: [hyp[0]!], evidence: [{ id: 'e1', label: 'x', grade: A2 }], cells: { e1: { h1: 2 } } });
+    expect(attributionGate(solo).reasons[0]).toMatch(/only one hypothesis/);
   });
 });

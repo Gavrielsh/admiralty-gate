@@ -1,0 +1,52 @@
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: node packages/core/dist/cli.js decide --policy packages/core/examples/policy.example.json --tool whois --args '{"domain":"example.org"}' --user "whois example.org"
+      - name: Red-team report is reproducible
+        run: npm run redteam && git diff --exit-code RESULTS.md
+
+  # The same server tests against real PostgreSQL (PostGIS + pgvector) and Redis (BullMQ).
+  fusion-services:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: PostgreSQL with PostGIS and pgvector, Redis
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 postgresql-16-postgis-3 postgresql-16-pgvector redis-server
+          sudo service postgresql start
+          sudo service redis-server start
+          sudo -u postgres psql -c "create role admiralty login superuser password 'admiralty'"
+          sudo -u postgres createdb -O admiralty admiralty_test
+      - run: npm ci
+      - name: MaxMind test databases (GeoIP tests are skipped without them)
+        run: npm run fetch:test-data -w @admiralty-gate/server
+      - name: Compose file is valid
+        run: POSTGRES_PASSWORD=ci docker compose config --quiet
+      - run: npm test -w @admiralty-gate/server
+        env:
+          TEST_DATABASE_URL: postgres://admiralty:admiralty@127.0.0.1:5432/admiralty_test
+          TEST_REDIS_URL: redis://127.0.0.1:6379
